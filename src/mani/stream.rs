@@ -1,0 +1,770 @@
+use std::collections::BTreeMap;
+use thiserror::Error;
+use tokio::sync::mpsc::Sender;
+
+use bytes::Bytes;
+use tokio::sync::{mpsc::Receiver, oneshot};
+
+use crate::{
+    ManiStreamId, SequenceNumber,
+    compression::CompressionType,
+    datagram::{chunk::Chunk, router::DatagramChunkRouter},
+    mani::{
+        frame::{ManiReadFrame, ManiWriteFrame},
+        message::{ManiMessage, ManiNack, TransferError, TransferErrorCode},
+        transfer::{
+            compression::CompressedChunkReceiver,
+            recv::{
+                RecvPipelineCommand, TransferReliableRecvStream, TransferUnreliableRecvStream,
+                create_stream_pair,
+            },
+            send::{TransferSendCommand, TransferSendError, TransferSendStream},
+        },
+    },
+};
+
+enum ManiStreamRole {
+    Unknown,
+    Sender {
+        retransmission_buffer: BTreeMap<SequenceNumber, Chunk>,
+        #[allow(dead_code)]
+        current_sequence_number: SequenceNumber,
+        transfer_end_ack_sender: Option<oneshot::Sender<()>>,
+    },
+    Receiver {
+        retrans_chunk_sender: Sender<Chunk>,
+        pipeline_command_sender: Sender<RecvPipelineCommand>,
+    },
+}
+
+enum ManiStreamCommand {
+    StartTransfer {
+        compression: CompressionType,
+        initial_sequence_number: SequenceNumber,
+        data_size: Option<u64>,
+        response: oneshot::Sender<Result<TransferSendStream, TransferSendError>>,
+    },
+    EndTransfer {
+        final_sequence_number: SequenceNumber,
+        response: oneshot::Sender<Result<(), TransferSendError>>,
+    },
+    SendPayload {
+        payload: Bytes,
+        response: oneshot::Sender<Result<(), ManiStreamError>>,
+    },
+}
+
+#[derive(Error, Debug, Clone)]
+pub enum ManiStreamError {
+    #[error("stream closed")]
+    StreamClosed,
+    #[error("expected payload, got transfer")]
+    ExpectedPayload,
+    #[error("expected transfer, got payload")]
+    ExpectedTransfer,
+}
+
+pub enum ManiRecvMessage {
+    Transfer(TransferReliableRecvStream, TransferUnreliableRecvStream),
+    Payload(Bytes),
+}
+
+pub(crate) struct ManiStreamTask {
+    pub id: ManiStreamId,
+    pub max_retransmission_buffer_size: usize,
+    #[allow(dead_code)]
+    pub max_nack_channel_size: usize,
+    pub max_datagram_channel_size: usize,
+
+    pub writer: ManiWriteFrame<quinn::SendStream>,
+    pub reader: ManiReadFrame<quinn::RecvStream>,
+
+    pub message_sender: Sender<ManiRecvMessage>,
+    pub datagram_router: DatagramChunkRouter,
+
+    pub quic_connection: quinn::Connection,
+    role: ManiStreamRole,
+    command_receiver: Receiver<ManiStreamCommand>,
+    transfer_send_command_receiver: Receiver<TransferSendCommand>,
+    transfer_send_command_sender: Sender<TransferSendCommand>,
+    nack_sender: Sender<Vec<SequenceNumber>>,
+    nack_receiver: Receiver<Vec<SequenceNumber>>,
+}
+
+impl ManiStreamTask {
+    pub async fn run(mut self) {
+        self.role = ManiStreamRole::Unknown;
+
+        loop {
+            tokio::select! {
+                Some(command) = self.command_receiver.recv() => {
+                    if !self.handle_command(command).await {
+                        break;
+                    }
+                }
+                Some(send_command) = self.transfer_send_command_receiver.recv() => {
+                    if !self.handle_transfer_send_command(send_command).await {
+                        break;
+                    }
+                }
+                message = self.reader.read_frame() => {
+                    if !self.handle_message(message).await {
+                        break;
+                    }
+                }
+                Some(nacks) = self.nack_receiver.recv() => {
+                    let nack_msg = crate::mani::message::ManiMessage::Nack(crate::mani::message::ManiNack { sequence_numbers: nacks });
+                    if let Err(err) = self.writer.write_frame(&nack_msg).await {
+                        tracing::debug!("Failed to send NACK on stream {}: {}", self.id, err);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_transfer_send_command(&mut self, command: TransferSendCommand) -> bool {
+        match command {
+            TransferSendCommand::EndTransfer {
+                final_sequence_number,
+                response,
+            } => {
+                match self.end_transfer_internal(final_sequence_number).await {
+                    Ok(ack_rx) => {
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx)
+                                .await
+                            {
+                                Ok(Ok(())) => {
+                                    let _ = response.send(Ok(()));
+                                }
+                                Ok(Err(_)) => {
+                                    let _ =
+                                        response.send(Err(TransferSendError::DatagramSendFailed(
+                                            "TransferEndAck channel closed".to_string(),
+                                        )));
+                                }
+                                Err(_) => {
+                                    let _ =
+                                        response.send(Err(TransferSendError::DatagramSendFailed(
+                                            "Timeout waiting for TransferEndAck".to_string(),
+                                        )));
+                                }
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        let _ = response.send(Err(err));
+                    }
+                }
+                true
+            }
+            TransferSendCommand::SendTransferEndAck => {
+                if let Err(err) = self.writer.write_frame(&ManiMessage::TransferEndAck).await {
+                    tracing::debug!(
+                        "Failed to send TransferEndAck on stream {}: {}",
+                        self.id,
+                        err
+                    );
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: ManiStreamCommand) -> bool {
+        match command {
+            ManiStreamCommand::StartTransfer {
+                compression,
+                initial_sequence_number,
+                data_size,
+                response,
+            } => {
+                let result = self
+                    .start_transfer_internal(compression, initial_sequence_number, data_size)
+                    .await;
+                let _ = response.send(result);
+                true
+            }
+            ManiStreamCommand::EndTransfer {
+                final_sequence_number,
+                response,
+            } => {
+                match self.end_transfer_internal(final_sequence_number).await {
+                    Ok(ack_rx) => {
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx)
+                                .await
+                            {
+                                Ok(Ok(())) => {
+                                    let _ = response.send(Ok(()));
+                                }
+                                Ok(Err(_)) => {
+                                    let _ =
+                                        response.send(Err(TransferSendError::DatagramSendFailed(
+                                            "TransferEndAck channel closed".to_string(),
+                                        )));
+                                }
+                                Err(_) => {
+                                    let _ =
+                                        response.send(Err(TransferSendError::DatagramSendFailed(
+                                            "Timeout waiting for TransferEndAck".to_string(),
+                                        )));
+                                }
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        let _ = response.send(Err(err));
+                    }
+                }
+                true
+            }
+            ManiStreamCommand::SendPayload { payload, response } => {
+                let result = self
+                    .writer
+                    .write_frame(&crate::mani::message::ManiMessage::Payload(
+                        crate::mani::message::ManiPayload { payload },
+                    ))
+                    .await;
+                let _ = response.send(result.map_err(|_| ManiStreamError::StreamClosed));
+                true
+            }
+        }
+    }
+
+    async fn end_transfer_internal(
+        &mut self,
+        final_sequence_number: SequenceNumber,
+    ) -> Result<oneshot::Receiver<()>, TransferSendError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        match &mut self.role {
+            ManiStreamRole::Sender {
+                transfer_end_ack_sender,
+                ..
+            } => {
+                *transfer_end_ack_sender = Some(ack_tx);
+            }
+            _ => {
+                return Err(TransferSendError::DatagramSendFailed(
+                    "Not in Sender role".to_string(),
+                ));
+            }
+        }
+
+        if let Err(err) = self
+            .writer
+            .write_frame(&ManiMessage::TransferEnd(
+                crate::mani::message::TransferEnd {
+                    final_sequence_number,
+                },
+            ))
+            .await
+        {
+            return Err(TransferSendError::DatagramSendFailed(err.to_string()));
+        }
+
+        Ok(ack_rx)
+    }
+
+    async fn start_transfer_internal(
+        &mut self,
+        compression: CompressionType,
+        initial_sequence_number: SequenceNumber,
+        data_size: Option<u64>,
+    ) -> Result<TransferSendStream, TransferSendError> {
+        let compression_impl = compression
+            .to_boxed_compression()
+            .ok_or(TransferSendError::CompressionFailed)?;
+
+        if let Err(err) = self
+            .writer
+            .write_frame(&ManiMessage::TransferStart(
+                crate::mani::message::TransferStart {
+                    compression_type: compression,
+                    initial_sequence_number,
+                    data_size,
+                },
+            ))
+            .await
+        {
+            return Err(TransferSendError::DatagramSendFailed(err.to_string()));
+        }
+
+        self.role = ManiStreamRole::Sender {
+            retransmission_buffer: BTreeMap::new(),
+            current_sequence_number: initial_sequence_number,
+            transfer_end_ack_sender: None,
+        };
+
+        Ok(TransferSendStream::new(
+            self.id,
+            compression_impl,
+            self.quic_connection.clone(),
+            initial_sequence_number,
+            self.max_retransmission_buffer_size,
+            self.transfer_send_command_sender.clone(),
+        ))
+    }
+
+    async fn handle_message(&mut self, message: Option<ManiMessage>) -> bool {
+        if let Some(message) = message {
+            tracing::trace!("Received message on stream {}: {:?}", self.id, message);
+
+            match message {
+                ManiMessage::TransferStart(transfer_start) => {
+                    self.handle_transfer_start(transfer_start).await
+                }
+                ManiMessage::Payload(payload) => self.handle_payload(payload).await,
+                ManiMessage::Nack(nack) => self.handle_nack(nack).await,
+                ManiMessage::Retrans(retrans) => self.handle_retrans(retrans).await,
+                ManiMessage::TransferEnd(transfer_end) => {
+                    self.handle_transfer_end(transfer_end).await
+                }
+                ManiMessage::TransferEndAck => self.handle_transfer_end_ack().await,
+                ManiMessage::TransferError(transfer_error) => {
+                    self.handle_transfer_error(transfer_error).await
+                }
+                _ => {
+                    tracing::debug!(
+                        "Received unsupported message type on stream {}: {:?}",
+                        self.id,
+                        message
+                    );
+                    true
+                }
+            }
+        } else {
+            tracing::debug!("Stream {} closed by peer", self.id);
+            false
+        }
+    }
+
+    async fn handle_transfer_start(
+        &mut self,
+        transfer_start: crate::mani::message::TransferStart,
+    ) -> bool {
+        if let Some(compression) = transfer_start.compression_type.to_boxed_compression() {
+            let (dg_sender, dg_receiver) =
+                tokio::sync::mpsc::channel(self.max_datagram_channel_size);
+
+            self.datagram_router.register(self.id, dg_sender.clone());
+
+            let (s1, r1) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
+            let (s2, r2) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
+            let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1);
+
+            let mut compression_receiver =
+                CompressedChunkReceiver::new(dg_receiver, vec![s1, s2], compression);
+
+            tokio::spawn(async move {
+                compression_receiver.run().await;
+            });
+
+            let (rel, unrel) = create_stream_pair(
+                self.id,
+                r1,
+                r2,
+                self.nack_sender.clone(),
+                self.max_retransmission_buffer_size,
+                pipeline_rx,
+            );
+
+            self.role = ManiStreamRole::Receiver {
+                retrans_chunk_sender: dg_sender,
+                pipeline_command_sender: pipeline_tx,
+            };
+
+            if let Err(err) = self
+                .message_sender
+                .send(ManiRecvMessage::Transfer(rel, unrel))
+                .await
+            {
+                tracing::debug!("Failed to send transfer streams to channel: {}", err);
+                return false;
+            }
+            true
+        } else {
+            tracing::debug!(
+                "Received unsupported compression type on stream {}: {:?}",
+                self.id,
+                transfer_start.compression_type
+            );
+
+            self.writer
+                .write_frame(&ManiMessage::TransferError(TransferError {
+                    error_code: TransferErrorCode::UnsupportedCompression,
+                }))
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::debug!(
+                        "Failed to send TransferError on stream {}: {}",
+                        self.id,
+                        err
+                    );
+                });
+            true
+        }
+    }
+
+    async fn handle_payload(&mut self, payload: crate::mani::message::ManiPayload) -> bool {
+        if let Err(err) = self
+            .message_sender
+            .send(ManiRecvMessage::Payload(payload.payload))
+            .await
+        {
+            tracing::debug!("Failed to send payload to channel: {}", err);
+            return false;
+        }
+        true
+    }
+
+    async fn handle_nack(&mut self, nack: ManiNack) -> bool {
+        let retrans_messages: Vec<_> = match &self.role {
+            ManiStreamRole::Sender {
+                retransmission_buffer,
+                ..
+            } => nack
+                .sequence_numbers
+                .iter()
+                .filter_map(|seq_num| {
+                    retransmission_buffer.get(seq_num).map(|chunk| {
+                        crate::mani::message::ManiRetrans {
+                            sequence_number: *seq_num,
+                            timestamp: chunk.timestamp,
+                            payload: chunk.content.clone(),
+                        }
+                    })
+                })
+                .collect(),
+            _ => {
+                tracing::debug!("Received NACK on stream {} but not in Sender role", self.id);
+                return true;
+            }
+        };
+
+        for retrans in retrans_messages {
+            if let Err(err) = self
+                .writer
+                .write_frame(&ManiMessage::Retrans(retrans))
+                .await
+            {
+                tracing::debug!("Failed to send Retrans on stream {}: {}", self.id, err);
+                return false;
+            }
+        }
+
+        if let ManiStreamRole::Sender {
+            retransmission_buffer,
+            ..
+        } = &self.role
+        {
+            for seq_num in &nack.sequence_numbers {
+                if !retransmission_buffer.contains_key(seq_num) {
+                    tracing::warn!(
+                        "Cannot retransmit seq {} on stream {} - not in buffer",
+                        seq_num,
+                        self.id
+                    );
+                }
+            }
+        }
+
+        true
+    }
+
+    async fn handle_retrans(&mut self, retrans: crate::mani::message::ManiRetrans) -> bool {
+        match &self.role {
+            ManiStreamRole::Receiver {
+                retrans_chunk_sender,
+                ..
+            } => {
+                let chunk = Chunk {
+                    stream_id: self.id,
+                    sequence_number: retrans.sequence_number,
+                    timestamp: retrans.timestamp,
+                    content: retrans.payload,
+                };
+
+                if let Err(err) = retrans_chunk_sender.send(chunk).await {
+                    tracing::debug!(
+                        "Failed to send retransmitted chunk to pipeline on stream {}: {}",
+                        self.id,
+                        err
+                    );
+                    return false;
+                }
+                true
+            }
+            _ => {
+                tracing::debug!(
+                    "Received Retrans on stream {} but not in Receiver role",
+                    self.id
+                );
+                true
+            }
+        }
+    }
+
+    async fn handle_transfer_end(
+        &mut self,
+        transfer_end: crate::mani::message::TransferEnd,
+    ) -> bool {
+        match &self.role {
+            ManiStreamRole::Receiver {
+                pipeline_command_sender,
+                ..
+            } => {
+                tracing::debug!(
+                    "Received TransferEnd on stream {} with final seq {}",
+                    self.id,
+                    transfer_end.final_sequence_number
+                );
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+
+                if let Err(err) = pipeline_command_sender
+                    .send(RecvPipelineCommand::EndTransfer {
+                        final_sequence_number: transfer_end.final_sequence_number,
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    tracing::debug!(
+                        "Failed to send EndTransfer to pipeline on stream {}: {}",
+                        self.id,
+                        err
+                    );
+                    return false;
+                }
+
+                let command_sender = self.transfer_send_command_sender.clone();
+                tokio::spawn(async move {
+                    if reply_rx.await.is_ok() {
+                        let _ = command_sender
+                            .send(TransferSendCommand::SendTransferEndAck)
+                            .await;
+                    }
+                });
+
+                true
+            }
+            _ => {
+                tracing::debug!(
+                    "Received TransferEnd on stream {} but not in Receiver role",
+                    self.id
+                );
+                true
+            }
+        }
+    }
+
+    async fn handle_transfer_end_ack(&mut self) -> bool {
+        match &mut self.role {
+            ManiStreamRole::Sender {
+                transfer_end_ack_sender,
+                ..
+            } => {
+                if let Some(sender) = transfer_end_ack_sender.take() {
+                    let _ = sender.send(());
+                    tracing::debug!("Sent TransferEndAck notification on stream {}", self.id);
+                } else {
+                    tracing::warn!(
+                        "Received TransferEndAck on stream {} but no pending end transfer",
+                        self.id
+                    );
+                }
+                true
+            }
+            _ => {
+                tracing::debug!(
+                    "Received TransferEndAck on stream {} but not in Sender role",
+                    self.id
+                );
+                true
+            }
+        }
+    }
+
+    async fn handle_transfer_error(&mut self, transfer_error: TransferError) -> bool {
+        tracing::error!(
+            "Received TransferError on stream {}: {:?}",
+            self.id,
+            transfer_error.error_code
+        );
+        true
+    }
+}
+
+pub struct ManiStream {
+    pub id: ManiStreamId,
+
+    message_receiver: Receiver<ManiRecvMessage>,
+    command_sender: Sender<ManiStreamCommand>,
+}
+
+impl ManiStream {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pair(
+        id: ManiStreamId,
+        quic_connection: quinn::Connection,
+        writer: ManiWriteFrame<quinn::SendStream>,
+        reader: ManiReadFrame<quinn::RecvStream>,
+        datagram_router: DatagramChunkRouter,
+        max_retransmission_buffer_size: usize,
+        max_nack_channel_size: usize,
+        max_datagram_channel_size: usize,
+    ) -> (Self, ManiStreamTask) {
+        let (message_sender, message_receiver) = tokio::sync::mpsc::channel(100);
+        let (command_sender, command_receiver) = tokio::sync::mpsc::channel(100);
+        let (transfer_send_command_sender, transfer_send_command_receiver) =
+            tokio::sync::mpsc::channel(100);
+        let (nack_sender, nack_receiver) = tokio::sync::mpsc::channel(max_nack_channel_size);
+
+        let stream = Self {
+            id,
+            message_receiver,
+            command_sender,
+        };
+
+        let task = ManiStreamTask {
+            id,
+            max_retransmission_buffer_size,
+            max_nack_channel_size,
+            max_datagram_channel_size,
+            writer,
+            reader,
+            message_sender,
+            datagram_router,
+            quic_connection,
+            role: ManiStreamRole::Unknown,
+            command_receiver,
+            transfer_send_command_receiver,
+            transfer_send_command_sender,
+            nack_sender,
+            nack_receiver,
+        };
+
+        (stream, task)
+    }
+
+    pub async fn recv(&mut self) -> Option<ManiRecvMessage> {
+        self.message_receiver.recv().await
+    }
+
+    pub async fn recv_payload(&mut self) -> Result<Bytes, ManiStreamError> {
+        match self.recv().await {
+            Some(ManiRecvMessage::Payload(bytes)) => Ok(bytes),
+            Some(ManiRecvMessage::Transfer(_, _)) => Err(ManiStreamError::ExpectedPayload),
+            None => Err(ManiStreamError::StreamClosed),
+        }
+    }
+
+    pub async fn accept_transfer(
+        &mut self,
+    ) -> Result<(TransferReliableRecvStream, TransferUnreliableRecvStream), ManiStreamError> {
+        match self.recv().await {
+            Some(ManiRecvMessage::Transfer(rel, unrel)) => Ok((rel, unrel)),
+            Some(ManiRecvMessage::Payload(_)) => Err(ManiStreamError::ExpectedTransfer),
+            None => Err(ManiStreamError::StreamClosed),
+        }
+    }
+
+    pub async fn start_transfer(
+        &mut self,
+        compression: CompressionType,
+        initial_sequence_number: SequenceNumber,
+        data_size: Option<u64>,
+    ) -> Result<TransferSendStream, TransferSendError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.command_sender
+            .send(ManiStreamCommand::StartTransfer {
+                compression,
+                initial_sequence_number,
+                data_size,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| {
+                TransferSendError::DatagramSendFailed(
+                    "Failed to send start transfer command".to_string(),
+                )
+            })?;
+
+        response_rx.await.map_err(|_| {
+            TransferSendError::DatagramSendFailed(
+                "Failed to receive start transfer response".to_string(),
+            )
+        })?
+    }
+
+    pub async fn end_transfer(
+        &mut self,
+        final_sequence_number: SequenceNumber,
+    ) -> Result<(), TransferSendError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.command_sender
+            .send(ManiStreamCommand::EndTransfer {
+                final_sequence_number,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| {
+                TransferSendError::DatagramSendFailed(
+                    "Failed to send end transfer command".to_string(),
+                )
+            })?;
+
+        response_rx.await.map_err(|_| {
+            TransferSendError::DatagramSendFailed(
+                "Failed to receive end transfer response".to_string(),
+            )
+        })?
+    }
+
+    pub async fn send_payload(&mut self, payload: Bytes) -> Result<(), ManiStreamError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_sender
+            .send(ManiStreamCommand::SendPayload {
+                payload,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ManiStreamError::StreamClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ManiStreamError::StreamClosed)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_role_transitions_pattern() {
+
+        let initial_role = ManiStreamRole::Unknown;
+        assert!(matches!(initial_role, ManiStreamRole::Unknown));
+
+        let sender_role = ManiStreamRole::Sender {
+            retransmission_buffer: BTreeMap::new(),
+            current_sequence_number: SequenceNumber(1),
+            transfer_end_ack_sender: None,
+        };
+        assert!(matches!(sender_role, ManiStreamRole::Sender { .. }));
+
+        let (dg_tx, _) = tokio::sync::mpsc::channel(1);
+        let (cmd_tx, _) = tokio::sync::mpsc::channel(1);
+
+        let receiver_role = ManiStreamRole::Receiver {
+            retrans_chunk_sender: dg_tx,
+            pipeline_command_sender: cmd_tx,
+        };
+        assert!(matches!(receiver_role, ManiStreamRole::Receiver { .. }));
+    }
+}

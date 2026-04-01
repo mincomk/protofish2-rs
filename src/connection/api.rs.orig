@@ -1,0 +1,260 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use quinn::Endpoint;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use thiserror::Error;
+use tokio::sync::RwLock;
+
+use crate::compression::CompressionType;
+use crate::connection::codec::ControlStreamCodec;
+use crate::connection::message::{ClientHello, ConnectionMessage, ServerHello};
+
+#[derive(Error, Debug)]
+pub enum ProtofishConnectionError {
+    #[error("Quic connection error: {0}")]
+    QuicError(#[from] quinn::ConnectionError),
+    #[error("Endpoint error")]
+    EndpointError,
+    #[error("Handshake failed: {0}")]
+    HandshakeFailed(String),
+    #[error("IO Error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Write Error")]
+    WriteError(#[from] quinn::WriteError),
+    #[error("Read Error")]
+    ReadError(#[from] quinn::ReadError),
+}
+
+pub struct ServerConfig {
+    pub bind_address: SocketAddr,
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
+    pub supported_compression_types: Vec<CompressionType>,
+    pub keepalive_interval: Duration,
+    pub protofish_config: crate::config::ProtofishConfig,
+}
+
+pub struct ProtofishServer {
+    endpoint: Endpoint,
+    config: Arc<ServerConfig>,
+}
+
+impl ProtofishServer {
+    pub fn bind(config: ServerConfig) -> Result<Self, ProtofishConnectionError> {
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(config.cert_chain.clone(), config.private_key.clone_key())
+            .map_err(|_| ProtofishConnectionError::EndpointError)?;
+
+        server_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
+
+        let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                .map_err(|_| ProtofishConnectionError::EndpointError)?,
+        ));
+
+        let endpoint = quinn::Endpoint::server(server_config, config.bind_address)
+            .map_err(|_| ProtofishConnectionError::EndpointError)?;
+
+        Ok(Self {
+            endpoint,
+            config: Arc::new(config),
+        })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    pub async fn accept(&self) -> Option<IncomingProtofishConnection> {
+        let incoming = self.endpoint.accept().await?;
+        Some(IncomingProtofishConnection {
+            incoming,
+            server_config: self.config.clone(),
+        })
+    }
+}
+
+pub struct IncomingProtofishConnection {
+    incoming: quinn::Incoming,
+    server_config: Arc<ServerConfig>,
+}
+
+impl IncomingProtofishConnection {
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.incoming.remote_address()
+    }
+
+    pub async fn accept(self) -> Result<ProtofishConnection, ProtofishConnectionError> {
+        let conn = self.incoming.await?;
+
+        let (send, recv) = conn.accept_bi().await?;
+
+        let mut framed_recv = tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
+        let mut framed_send = tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
+
+        let hello_msg = framed_recv.next().await.ok_or_else(|| {
+            ProtofishConnectionError::HandshakeFailed("Connection closed before ClientHello".into())
+        })??;
+
+        let client_hello = match hello_msg {
+            ConnectionMessage::ClientHello(hello) => hello,
+            _ => {
+                return Err(ProtofishConnectionError::HandshakeFailed(
+                    "Expected ClientHello".into(),
+                ));
+            }
+        };
+
+        if client_hello.version != 1 {
+            return Err(ProtofishConnectionError::HandshakeFailed(format!(
+                "Unsupported version {}",
+                client_hello.version
+            )));
+        }
+
+        // Negotiate compression
+        let compression_type = self
+            .server_config
+            .supported_compression_types
+            .iter()
+            .find(|&&c| client_hello.available_compression_types.contains(&c))
+            .copied()
+            .unwrap_or(CompressionType::None);
+
+        let server_hello = ServerHello {
+            version: 1,
+            headers: HashMap::new(),
+            compression_type,
+            keepalive_interval_ms: self.server_config.keepalive_interval.as_millis() as u32,
+        };
+
+        framed_send
+            .send(ConnectionMessage::ServerHello(server_hello))
+            .await?;
+
+        Ok(ProtofishConnection {
+            quic_conn: conn,
+            state: Arc::new(RwLock::new(ConnectionState { compression_type })),
+        })
+    }
+}
+
+pub struct ClientConfig {
+    pub bind_address: SocketAddr,
+    pub root_certificates: Vec<CertificateDer<'static>>,
+    pub supported_compression_types: Vec<CompressionType>,
+    pub keepalive_range: Range<Duration>,
+    pub protofish_config: crate::config::ProtofishConfig,
+}
+
+pub struct ProtofishClient {
+    endpoint: Endpoint,
+    config: Arc<ClientConfig>,
+}
+
+impl ProtofishClient {
+    pub fn bind(config: ClientConfig) -> Result<Self, ProtofishConnectionError> {
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in &config.root_certificates {
+            root_store
+                .add(cert.clone())
+                .map_err(|_| ProtofishConnectionError::EndpointError)?;
+        }
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        client_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
+
+        let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .map_err(|_| ProtofishConnectionError::EndpointError)?,
+        ));
+
+        let mut endpoint = quinn::Endpoint::client(config.bind_address)
+            .map_err(|_| ProtofishConnectionError::EndpointError)?;
+
+        endpoint.set_default_client_config(client_config);
+
+        Ok(Self {
+            endpoint,
+            config: Arc::new(config),
+        })
+    }
+
+    pub async fn connect(
+        &self,
+        server_addr: SocketAddr,
+        server_name: &str,
+        headers: HashMap<String, Bytes>,
+    ) -> Result<ProtofishConnection, ProtofishConnectionError> {
+        let conn = self
+            .endpoint
+            .connect(server_addr, server_name)
+            .map_err(|_| ProtofishConnectionError::EndpointError)?
+            .await?;
+
+        let (send, recv) = conn.open_bi().await?;
+
+        let mut framed_recv = tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
+        let mut framed_send = tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
+
+        let client_hello = ClientHello {
+            version: 1,
+            host: server_name.to_string(),
+            headers,
+            available_compression_types: self.config.supported_compression_types.clone(),
+            keepalive_min_ms: self.config.keepalive_range.start.as_millis() as u32,
+            keepalive_max_ms: self.config.keepalive_range.end.as_millis() as u32,
+        };
+
+        framed_send
+            .send(ConnectionMessage::ClientHello(client_hello))
+            .await?;
+
+        let hello_resp = framed_recv.next().await.ok_or_else(|| {
+            ProtofishConnectionError::HandshakeFailed("Connection closed before ServerHello".into())
+        })??;
+
+        let server_hello = match hello_resp {
+            ConnectionMessage::ServerHello(hello) => hello,
+            _ => {
+                return Err(ProtofishConnectionError::HandshakeFailed(
+                    "Expected ServerHello".into(),
+                ));
+            }
+        };
+
+        Ok(ProtofishConnection {
+            quic_conn: conn,
+            state: Arc::new(RwLock::new(ConnectionState {
+                compression_type: server_hello.compression_type,
+            })),
+        })
+    }
+}
+
+pub struct ConnectionState {
+    pub compression_type: CompressionType,
+}
+
+pub struct ProtofishConnection {
+    #[allow(dead_code)]
+    pub quic_conn: quinn::Connection,
+    #[allow(dead_code)]
+    pub state: Arc<RwLock<ConnectionState>>,
+}
+
+impl ProtofishConnection {
+    pub fn close(&self) {
+        self.quic_conn.close(quinn::VarInt::from_u32(0), b"");
+    }
+}
