@@ -43,6 +43,7 @@ impl<R: AsyncRead + Unpin> ManiReadFrame<R> {
     }
 }
 
+#[allow(dead_code)]
 pub struct ManiWriteFrame<W: AsyncWrite + Unpin> {
     pub stream_id: ManiStreamId,
 

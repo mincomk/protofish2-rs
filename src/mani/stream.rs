@@ -54,18 +54,28 @@ enum ManiStreamCommand {
     },
 }
 
+/// Errors that can occur during Mani stream operations.
 #[derive(Error, Debug, Clone)]
 pub enum ManiStreamError {
+    /// The stream has been closed by the peer.
     #[error("stream closed")]
     StreamClosed,
+
+    /// Expected payload data but received a transfer initiation.
     #[error("expected payload, got transfer")]
     ExpectedPayload,
+
+    /// Expected a transfer initiation but received payload data.
     #[error("expected transfer, got payload")]
     ExpectedTransfer,
 }
 
+/// Messages that can be received from a stream.
 pub enum ManiRecvMessage {
+    /// An incoming transfer request with reliable and unreliable receivers.
     Transfer(TransferReliableRecvStream, TransferUnreliableRecvStream),
+
+    /// Raw payload data.
     Payload(Bytes),
 }
 
@@ -598,6 +608,32 @@ impl ManiStreamTask {
     }
 }
 
+/// A bidirectional stream for exchanging data with a peer.
+///
+/// A `ManiStream` can be used in two modes:
+/// - **Sender mode**: Call `start_transfer()` to begin sending data reliably
+/// - **Receiver mode**: Call `accept_transfer()` to receive incoming data
+///
+/// # Examples
+///
+/// Sending data:
+///
+/// ```ignore
+/// let mut stream = conn.open_mani().await?;
+/// let transfer = stream.start_transfer(CompressionType::None, SequenceNumber(0), None).await?;
+/// transfer.send(Timestamp(0), Bytes::from("Hello")).await?;
+/// transfer.end().await?;
+/// ```
+///
+/// Receiving data:
+///
+/// ```ignore
+/// let mut stream = conn.accept_mani().await?;
+/// let (reliable_recv, unreliable_recv) = stream.accept_transfer().await?;
+/// while let Some(data) = reliable_recv.recv().await {
+///     println!("Received: {:?}", data);
+/// }
+/// ```
 pub struct ManiStream {
     pub id: ManiStreamId,
 
@@ -650,10 +686,27 @@ impl ManiStream {
         (stream, task)
     }
 
+    /// Receives the next message from the stream.
+    ///
+    /// Returns `None` if the stream has been closed by the peer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// while let Some(msg) = stream.recv().await {
+    ///     match msg {
+    ///         ManiRecvMessage::Transfer(rel, unrel) => { /* handle transfer */ },
+    ///         ManiRecvMessage::Payload(data) => { /* handle payload */ },
+    ///     }
+    /// }
+    /// ```
     pub async fn recv(&mut self) -> Option<ManiRecvMessage> {
         self.message_receiver.recv().await
     }
 
+    /// Receives the next message, expecting it to be payload data.
+    ///
+    /// Returns an error if the message is a transfer request or if the stream is closed.
     pub async fn recv_payload(&mut self) -> Result<Bytes, ManiStreamError> {
         match self.recv().await {
             Some(ManiRecvMessage::Payload(bytes)) => Ok(bytes),
@@ -662,6 +715,21 @@ impl ManiStream {
         }
     }
 
+    /// Accepts an incoming transfer request.
+    ///
+    /// Returns reliable and unreliable receivers for the transfer.
+    /// The reliable receiver delivers data in order with retransmission.
+    /// The unreliable receiver may skip damaged chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message is payload data or if the stream is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let (reliable, unreliable) = stream.accept_transfer().await?;
+    /// ```
     pub async fn accept_transfer(
         &mut self,
     ) -> Result<(TransferReliableRecvStream, TransferUnreliableRecvStream), ManiStreamError> {
@@ -672,6 +740,27 @@ impl ManiStream {
         }
     }
 
+    /// Initiates a reliable data transfer.
+    ///
+    /// # Arguments
+    ///
+    /// * `compression` - Compression type to use (e.g., `CompressionType::None`)
+    /// * `initial_sequence_number` - Starting sequence number for chunks
+    /// * `data_size` - Optional total size hint for the transfer (for optimization)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let transfer = stream.start_transfer(
+    ///     CompressionType::None,
+    ///     SequenceNumber(0),
+    ///     None,
+    /// ).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transfer cannot be initiated (e.g., channel failure).
     pub async fn start_transfer(
         &mut self,
         compression: CompressionType,
@@ -701,6 +790,21 @@ impl ManiStream {
         })?
     }
 
+    /// Ends the current transfer and waits for acknowledgment from the peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `final_sequence_number` - The sequence number of the last chunk sent
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// transfer.end().await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream fails or if the peer doesn't acknowledge within timeout.
     pub async fn end_transfer(
         &mut self,
         final_sequence_number: SequenceNumber,
@@ -726,6 +830,13 @@ impl ManiStream {
         })?
     }
 
+    /// Sends a raw payload message on the stream.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// stream.send_payload(Bytes::from("Hello")).await?;
+    /// ```
     pub async fn send_payload(&mut self, payload: Bytes) -> Result<(), ManiStreamError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_sender

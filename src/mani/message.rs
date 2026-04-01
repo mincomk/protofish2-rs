@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::{SequenceNumber, Timestamp, compression::CompressionType};
+use crate::{compression::CompressionType, SequenceNumber, Timestamp};
 
 #[derive(Debug, Clone)]
 pub struct ManiHello {
@@ -103,6 +103,7 @@ impl ManiMessageType {
 }
 
 impl ManiMessage {
+    #[allow(dead_code)]
     pub fn message_type(&self) -> ManiMessageType {
         match self {
             ManiMessage::Hello(_) => ManiMessageType::Hello,

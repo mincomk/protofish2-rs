@@ -10,18 +10,25 @@ use crate::{
     datagram::chunk::{Chunk, serialize_chunk},
 };
 
+/// Errors that can occur during a send transfer.
 #[derive(Error, Debug, Clone)]
 pub enum TransferSendError {
+    /// The retransmission buffer has reached its maximum capacity.
+    /// Send fewer chunks before receiving acknowledgments.
     #[error("retransmission buffer is full")]
     RetransmissionBufferFull,
 
+    /// Failed to send data via QUIC datagram.
     #[error("failed to send datagram: {0}")]
     DatagramSendFailed(String),
 
+    /// Compression initialization failed.
     #[error("compression failed")]
     CompressionFailed,
 }
 
+/// Internal command for transfer state management.
+#[doc(hidden)]
 pub(crate) enum TransferSendCommand {
     EndTransfer {
         final_sequence_number: SequenceNumber,
@@ -30,6 +37,19 @@ pub(crate) enum TransferSendCommand {
     SendTransferEndAck,
 }
 
+/// A stream for reliably sending data with compression support.
+///
+/// This stream handles compression, chunking, and buffering for retransmission.
+/// Chunks are automatically retransmitted if NACKed by the receiver.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut send = transfer_send_stream;
+/// send.send(Timestamp(0), Bytes::from("chunk 1")).await?;
+/// send.send(Timestamp(1), Bytes::from("chunk 2")).await?;
+/// send.end().await?;
+/// ```
 pub struct TransferSendStream {
     id: ManiStreamId,
     compression: Box<dyn Compression>,
@@ -41,6 +61,7 @@ pub struct TransferSendStream {
 }
 
 impl TransferSendStream {
+    #[doc(hidden)]
     pub(crate) fn new(
         id: ManiStreamId,
         compression: Box<dyn Compression>,
@@ -60,6 +81,23 @@ impl TransferSendStream {
         }
     }
 
+    /// Sends a chunk of data.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp` - When this chunk was created (in milliseconds)
+    /// * `content` - The data to send
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// send.send(Timestamp(1000), Bytes::from("Hello")).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransferSendError::RetransmissionBufferFull` if the buffer is full.
+    /// The caller should wait for NACKs to be processed before retrying.
     pub async fn send(
         &mut self,
         timestamp: Timestamp,
@@ -92,10 +130,28 @@ impl TransferSendStream {
         Ok(())
     }
 
+    /// Gets the current sequence number.
+    ///
+    /// This is the sequence number that will be used for the next chunk.
     pub fn current_sequence_number(&self) -> SequenceNumber {
         self.sequence_counter
     }
 
+    /// Signals the end of the transfer and waits for acknowledgment.
+    ///
+    /// After calling this, no more data can be sent. The peer will be notified
+    /// and must acknowledge the transfer end.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// send.end().await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream fails or if acknowledgment is not received
+    /// within the timeout period (5 seconds).
     pub async fn end(&mut self) -> Result<(), TransferSendError> {
         let final_sequence_number = SequenceNumber(self.sequence_counter.0.wrapping_sub(1));
 

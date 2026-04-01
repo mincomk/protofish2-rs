@@ -1,15 +1,33 @@
 use std::io::Read;
 
+/// Supported compression algorithms for data transfers.
+///
+/// # Examples
+///
+/// ```
+/// use protofish2::compression::CompressionType;
+///
+/// let comp = CompressionType::Gzip;
+/// println!("Using compression: {:?}", comp);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CompressionType {
+    /// No compression - data is sent as-is
     None = 0,
+
+    /// Gzip compression (RFC 1952)
     Gzip = 1,
+
+    /// Zstandard compression
     Zstd = 2,
+
+    /// LZ4 compression
     Lz4 = 3,
 }
 
 impl CompressionType {
+    /// Converts a byte value to a `CompressionType`.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(CompressionType::None),
@@ -20,7 +38,8 @@ impl CompressionType {
         }
     }
 
-    pub fn to_boxed_compression(&self) -> Option<Box<dyn Compression>> {
+    /// Creates a boxed compression implementation for the selected type.
+    pub(crate) fn to_boxed_compression(&self) -> Option<Box<dyn Compression>> {
         match self {
             CompressionType::None => Some(Box::new(NoCompression)),
             CompressionType::Gzip => Some(Box::new(GzipCompression)),
@@ -30,6 +49,8 @@ impl CompressionType {
     }
 }
 
+/// Internal trait for compression implementations.
+#[doc(hidden)]
 pub trait Compression: Send + Sync {
     fn compression_type(&self) -> CompressionType;
 

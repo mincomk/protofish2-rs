@@ -1,2 +1,4 @@
-pub mod chunk;
-pub mod router;
+//! Internal datagram handling for chunk routing.
+
+pub(crate) mod chunk;
+pub(crate) mod router;
