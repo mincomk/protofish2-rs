@@ -489,9 +489,7 @@ pub struct ConnectionState {
 /// send.end().await?;
 /// ```
 pub struct ProtofishConnection {
-    #[allow(dead_code)]
     pub quic_conn: quinn::Connection,
-    #[allow(dead_code)]
     pub state: Arc<RwLock<ConnectionState>>,
     pub datagram_router: crate::datagram::router::DatagramChunkRouter,
     pub protofish_config: crate::config::ProtofishConfig,
@@ -519,7 +517,7 @@ impl ProtofishConnection {
         let (send, recv) = self.quic_conn.open_bi().await?;
         let id = crate::ManiStreamId(send.id().index());
 
-        let writer = crate::mani::frame::ManiWriteFrame::new(id, send);
+        let writer = crate::mani::frame::ManiWriteFrame::new(send);
         let reader = crate::mani::frame::ManiReadFrame::new(id, recv);
 
         let (stream, task) = crate::mani::stream::ManiStream::pair(
@@ -570,7 +568,7 @@ impl ProtofishConnection {
         let (send, recv) = self.quic_conn.accept_bi().await?;
         let id = crate::ManiStreamId(send.id().index());
 
-        let writer = crate::mani::frame::ManiWriteFrame::new(id, send);
+        let writer = crate::mani::frame::ManiWriteFrame::new(send);
         let reader = crate::mani::frame::ManiReadFrame::new(id, recv);
 
         let (stream, task) = crate::mani::stream::ManiStream::pair(

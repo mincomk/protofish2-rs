@@ -43,17 +43,13 @@ impl<R: AsyncRead + Unpin> ManiReadFrame<R> {
     }
 }
 
-#[allow(dead_code)]
 pub struct ManiWriteFrame<W: AsyncWrite + Unpin> {
-    pub stream_id: ManiStreamId,
-
     stream: FramedWrite<W, LengthDelimitedCodec>,
 }
 
 impl<W: AsyncWrite + Unpin> ManiWriteFrame<W> {
-    pub fn new(stream_id: ManiStreamId, write_stream: W) -> Self {
+    pub fn new(write_stream: W) -> Self {
         Self {
-            stream_id,
             stream: FramedWrite::new(write_stream, LengthDelimitedCodec::new()),
         }
     }

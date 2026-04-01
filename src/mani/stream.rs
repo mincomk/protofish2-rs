@@ -27,8 +27,6 @@ enum ManiStreamRole {
     Unknown,
     Sender {
         retransmission_buffer: BTreeMap<SequenceNumber, Chunk>,
-        #[allow(dead_code)]
-        current_sequence_number: SequenceNumber,
         transfer_end_ack_sender: Option<oneshot::Sender<()>>,
     },
     Receiver {
@@ -82,8 +80,6 @@ pub enum ManiRecvMessage {
 pub(crate) struct ManiStreamTask {
     pub id: ManiStreamId,
     pub max_retransmission_buffer_size: usize,
-    #[allow(dead_code)]
-    pub max_nack_channel_size: usize,
     pub max_datagram_channel_size: usize,
 
     pub writer: ManiWriteFrame<quinn::SendStream>,
@@ -305,7 +301,6 @@ impl ManiStreamTask {
 
         self.role = ManiStreamRole::Sender {
             retransmission_buffer: BTreeMap::new(),
-            current_sequence_number: initial_sequence_number,
             transfer_end_ack_sender: None,
         };
 
@@ -668,7 +663,6 @@ impl ManiStream {
         let task = ManiStreamTask {
             id,
             max_retransmission_buffer_size,
-            max_nack_channel_size,
             max_datagram_channel_size,
             writer,
             reader,
@@ -858,13 +852,11 @@ mod tests {
 
     #[test]
     fn test_role_transitions_pattern() {
-
         let initial_role = ManiStreamRole::Unknown;
         assert!(matches!(initial_role, ManiStreamRole::Unknown));
 
         let sender_role = ManiStreamRole::Sender {
             retransmission_buffer: BTreeMap::new(),
-            current_sequence_number: SequenceNumber(1),
             transfer_end_ack_sender: None,
         };
         assert!(matches!(sender_role, ManiStreamRole::Sender { .. }));

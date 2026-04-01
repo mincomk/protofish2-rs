@@ -181,12 +181,4 @@ impl TransferSendStream {
             ))
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn get_chunk_for_retransmission(
-        &self,
-        sequence_number: SequenceNumber,
-    ) -> Option<&Chunk> {
-        self.retransmission_buffer.get(&sequence_number)
-    }
 }
