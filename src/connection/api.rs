@@ -266,6 +266,14 @@ impl IncomingProtofishConnection {
                 .protofish_config
                 .mani_config
                 .max_chunk_buffer_size,
+            self.server_config
+                .protofish_config
+                .mani_config
+                .pending_chunk_timeout,
+            self.server_config
+                .protofish_config
+                .mani_config
+                .pending_chunk_cleanup_interval,
         );
         let router_clone = datagram_router.clone();
         let quic_clone = conn.clone();
@@ -454,6 +462,14 @@ impl ProtofishClient {
                 .protofish_config
                 .mani_config
                 .max_chunk_buffer_size,
+            self.config
+                .protofish_config
+                .mani_config
+                .pending_chunk_timeout,
+            self.config
+                .protofish_config
+                .mani_config
+                .pending_chunk_cleanup_interval,
         );
         let router_clone = datagram_router.clone();
         let quic_clone = conn.clone();

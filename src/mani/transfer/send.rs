@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use dashmap::DashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use thiserror::Error;
@@ -55,7 +56,7 @@ pub struct TransferSendStream {
     compression: Box<dyn Compression>,
     quic_connection: quinn::Connection,
     sequence_counter: SequenceNumber,
-    retransmission_buffer: BTreeMap<SequenceNumber, Chunk>,
+    retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
     max_retransmission_buffer_size: usize,
     command_sender: Option<mpsc::Sender<TransferSendCommand>>,
 }
@@ -69,13 +70,14 @@ impl TransferSendStream {
         initial_sequence_number: SequenceNumber,
         max_retransmission_buffer_size: usize,
         command_sender: mpsc::Sender<TransferSendCommand>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
     ) -> Self {
         Self {
             id,
             compression,
             quic_connection,
             sequence_counter: initial_sequence_number,
-            retransmission_buffer: BTreeMap::new(),
+            retransmission_buffer,
             max_retransmission_buffer_size,
             command_sender: Some(command_sender),
         }

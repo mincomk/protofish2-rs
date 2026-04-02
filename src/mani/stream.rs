@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use dashmap::DashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -26,7 +27,7 @@ use crate::{
 enum ManiStreamRole {
     Unknown,
     Sender {
-        retransmission_buffer: BTreeMap<SequenceNumber, Chunk>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
         transfer_end_ack_sender: Option<oneshot::Sender<()>>,
     },
     Receiver {
@@ -299,8 +300,10 @@ impl ManiStreamTask {
             return Err(TransferSendError::DatagramSendFailed(err.to_string()));
         }
 
+        let retransmission_buffer = Arc::new(DashMap::new());
+
         self.role = ManiStreamRole::Sender {
-            retransmission_buffer: BTreeMap::new(),
+            retransmission_buffer: Arc::clone(&retransmission_buffer),
             transfer_end_ack_sender: None,
         };
 
@@ -311,6 +314,7 @@ impl ManiStreamTask {
             initial_sequence_number,
             self.max_retransmission_buffer_size,
             self.transfer_send_command_sender.clone(),
+            retransmission_buffer,
         ))
     }
 
@@ -431,19 +435,21 @@ impl ManiStreamTask {
             ManiStreamRole::Sender {
                 retransmission_buffer,
                 ..
-            } => nack
-                .sequence_numbers
-                .iter()
-                .filter_map(|seq_num| {
-                    retransmission_buffer.get(seq_num).map(|chunk| {
-                        crate::mani::message::ManiRetrans {
-                            sequence_number: *seq_num,
-                            timestamp: chunk.timestamp,
-                            payload: chunk.content.clone(),
-                        }
+            } => {
+                nack
+                    .sequence_numbers
+                    .iter()
+                    .filter_map(|seq_num| {
+                        retransmission_buffer.get(seq_num).map(|chunk| {
+                            crate::mani::message::ManiRetrans {
+                                sequence_number: *seq_num,
+                                timestamp: chunk.value().timestamp,
+                                payload: chunk.value().content.clone(),
+                            }
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             _ => {
                 tracing::debug!("Received NACK on stream {} but not in Sender role", self.id);
                 return true;
@@ -856,7 +862,7 @@ mod tests {
         assert!(matches!(initial_role, ManiStreamRole::Unknown));
 
         let sender_role = ManiStreamRole::Sender {
-            retransmission_buffer: BTreeMap::new(),
+            retransmission_buffer: Arc::new(DashMap::new()),
             transfer_end_ack_sender: None,
         };
         assert!(matches!(sender_role, ManiStreamRole::Sender { .. }));

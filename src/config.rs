@@ -28,6 +28,12 @@ pub struct ManiConfig {
     /// Maximum number of chunks in the receive buffer before delivery.
     /// Affects memory usage and delivery latency.
     pub max_chunk_buffer_size: usize,
+
+    /// Duration before a pending chunk that hasn't been matched to a stream is discarded.
+    pub pending_chunk_timeout: std::time::Duration,
+
+    /// Interval at which the pending chunk buffer is cleaned up.
+    pub pending_chunk_cleanup_interval: std::time::Duration,
 }
 
 impl Default for ManiConfig {
@@ -37,6 +43,8 @@ impl Default for ManiConfig {
             max_nack_channel_size: 100,
             max_datagram_channel_size: 1000,
             max_chunk_buffer_size: 1000,
+            pending_chunk_timeout: std::time::Duration::from_secs(5),
+            pending_chunk_cleanup_interval: std::time::Duration::from_secs(1),
         }
     }
 }
