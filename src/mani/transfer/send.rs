@@ -103,19 +103,12 @@ impl TransferSendStream {
     ///
     /// # Errors
     ///
-    /// Returns `TransferSendError::RetransmissionBufferFull` if the buffer is full.
     /// The caller should wait for NACKs to be processed before retrying.
     pub async fn send(
         &mut self,
         timestamp: Timestamp,
         content: Bytes,
     ) -> Result<(), TransferSendError> {
-        if self.mode == TransferMode::Dual
-            && self.retransmission_buffer.len() >= self.max_retransmission_buffer_size
-        {
-            return Err(TransferSendError::RetransmissionBufferFull);
-        }
-
         let compressed_content = self.compression.compress(&content);
 
         let packet = Packet {
@@ -132,6 +125,14 @@ impl TransferSendStream {
             .map_err(|e| TransferSendError::DatagramSendFailed(e.to_string()))?;
 
         if self.mode == TransferMode::Dual {
+            if self.retransmission_buffer.len() >= self.max_retransmission_buffer_size {
+                let oldest_seq = SequenceNumber(
+                    self.sequence_counter
+                        .0
+                        .wrapping_sub(self.max_retransmission_buffer_size as u32),
+                );
+                self.retransmission_buffer.remove(&oldest_seq);
+            }
             self.retransmission_buffer
                 .insert(self.sequence_counter, packet);
         }
