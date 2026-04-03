@@ -1,3 +1,6 @@
+[workspace]
+members = ["examples/jitter_ogg"]
+
 [package]
 name = "protofish2"
 version = "0.3.0"
