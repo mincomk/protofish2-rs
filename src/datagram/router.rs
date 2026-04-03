@@ -8,41 +8,41 @@ use tokio::time::Instant;
 
 use crate::{
     ManiStreamId,
-    datagram::chunk::{Chunk, parse_chunk},
+    datagram::packet::{Packet, parse_packet},
 };
 
 #[derive(Clone)]
-pub struct DatagramChunkRouter {
-    senders: Arc<DashMap<ManiStreamId, Sender<Chunk>>>,
-    pending_chunks: Arc<DashMap<ManiStreamId, Vec<(Instant, Chunk)>>>,
-    pub max_chunk_buffer_size: usize,
-    pub pending_chunk_timeout: Duration,
-    pub pending_chunk_cleanup_interval: Duration,
+pub struct DatagramPacketRouter {
+    senders: Arc<DashMap<ManiStreamId, Sender<Packet>>>,
+    pending_packets: Arc<DashMap<ManiStreamId, Vec<(Instant, Packet)>>>,
+    pub max_packet_buffer_size: usize,
+    pub pending_packet_timeout: Duration,
+    pub pending_packet_cleanup_interval: Duration,
 }
 
-impl DatagramChunkRouter {
+impl DatagramPacketRouter {
     pub fn new(
-        max_chunk_buffer_size: usize,
-        pending_chunk_timeout: Duration,
-        pending_chunk_cleanup_interval: Duration,
+        max_packet_buffer_size: usize,
+        pending_packet_timeout: Duration,
+        pending_packet_cleanup_interval: Duration,
     ) -> Self {
         Self {
             senders: Arc::new(DashMap::new()),
-            pending_chunks: Arc::new(DashMap::new()),
-            max_chunk_buffer_size,
-            pending_chunk_timeout,
-            pending_chunk_cleanup_interval,
+            pending_packets: Arc::new(DashMap::new()),
+            max_packet_buffer_size,
+            pending_packet_timeout,
+            pending_packet_cleanup_interval,
         }
     }
 
-    pub fn register(&mut self, stream_id: ManiStreamId, sender: Sender<Chunk>) {
+    pub fn register(&mut self, stream_id: ManiStreamId, sender: Sender<Packet>) {
         self.senders.insert(stream_id, sender.clone());
 
-        // Flush any pending chunks for this stream
-        if let Some((_, chunks)) = self.pending_chunks.remove(&stream_id) {
+        // Flush any pending packets for this stream
+        if let Some((_, packets)) = self.pending_packets.remove(&stream_id) {
             tokio::spawn(async move {
-                for (_, chunk) in chunks {
-                    if sender.send(chunk).await.is_err() {
+                for (_, packet) in packets {
+                    if sender.send(packet).await.is_err() {
                         break;
                     }
                 }
@@ -51,22 +51,22 @@ impl DatagramChunkRouter {
     }
 
     pub async fn run(&self, quic: quinn::Connection) {
-        let mut cleanup_interval = tokio::time::interval(self.pending_chunk_cleanup_interval);
+        let mut cleanup_interval = tokio::time::interval(self.pending_packet_cleanup_interval);
 
         loop {
             tokio::select! {
                 _ = cleanup_interval.tick() => {
-                    self.cleanup_pending_chunks();
+                    self.cleanup_pending_packets();
                 }
                 datagram_res = quic.read_datagram() => {
                     match datagram_res {
                         Ok(datagram) => {
                             tracing::trace!("Received datagram with length {}", datagram.len());
 
-                            if let Ok(chunk) = parse_chunk(datagram) {
-                                self.route(chunk.stream_id, chunk);
+                            if let Ok(packet) = parse_packet(datagram) {
+                                self.route(packet.stream_id, packet);
                             } else {
-                                tracing::warn!("Failed to parse datagram into chunk");
+                                tracing::warn!("Failed to parse datagram into packet");
                             }
                         }
                         Err(ConnectionError::ApplicationClosed(_)) => {
@@ -83,15 +83,15 @@ impl DatagramChunkRouter {
         }
     }
 
-    fn route(&self, stream_id: ManiStreamId, chunk: Chunk) {
+    fn route(&self, stream_id: ManiStreamId, packet: Packet) {
         let mut remove_senders = Vec::new();
         if let Some(sender) = self.senders.get(&stream_id) {
-            let sequence_number = chunk.sequence_number;
-            if let Err(err) = sender.try_send(chunk) {
+            let sequence_number = packet.sequence_number;
+            if let Err(err) = sender.try_send(packet) {
                 remove_senders.push(stream_id);
 
                 tracing::error!(
-                    "Tried to send chunk with sequence number {} to stream {}, to a closed stream: {}",
+                    "Tried to send packet with sequence number {} to stream {}, to a closed stream: {}",
                     sequence_number,
                     stream_id,
                     err
@@ -99,21 +99,21 @@ impl DatagramChunkRouter {
             }
         } else {
             tracing::trace!(
-                "Received chunk for unregistered stream {} with sequence number {}, buffering it",
+                "Received packet for unregistered stream {} with sequence number {}, buffering it",
                 stream_id,
-                chunk.sequence_number
+                packet.sequence_number
             );
             let mut entry = self
-                .pending_chunks
+                .pending_packets
                 .entry(stream_id)
                 .or_insert_with(Vec::new);
-            if entry.len() < self.max_chunk_buffer_size {
-                entry.push((Instant::now(), chunk));
+            if entry.len() < self.max_packet_buffer_size {
+                entry.push((Instant::now(), packet));
             } else {
                 tracing::warn!(
-                    "Pending chunk buffer full for stream {}, dropping sequence number {}",
+                    "Pending packet buffer full for stream {}, dropping sequence number {}",
                     stream_id,
-                    chunk.sequence_number
+                    packet.sequence_number
                 );
             }
         }
@@ -123,13 +123,13 @@ impl DatagramChunkRouter {
         }
     }
 
-    fn cleanup_pending_chunks(&self) {
+    fn cleanup_pending_packets(&self) {
         let now = Instant::now();
-        self.pending_chunks.retain(|_, chunks| {
-            chunks.retain(|(timestamp, _)| {
-                now.duration_since(*timestamp) < self.pending_chunk_timeout
+        self.pending_packets.retain(|_, packets| {
+            packets.retain(|(timestamp, _)| {
+                now.duration_since(*timestamp) < self.pending_packet_timeout
             });
-            !chunks.is_empty()
+            !packets.is_empty()
         });
     }
 }

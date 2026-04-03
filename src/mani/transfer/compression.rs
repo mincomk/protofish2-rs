@@ -1,18 +1,18 @@
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::{compression::Compression, datagram::chunk::Chunk};
+use crate::{compression::Compression, datagram::packet::Packet};
 
-pub struct CompressedChunkReceiver {
-    receiver: mpsc::Receiver<Chunk>,
-    senders: Vec<mpsc::Sender<Chunk>>,
+pub struct CompressedPacketReceiver {
+    receiver: mpsc::Receiver<Packet>,
+    senders: Vec<mpsc::Sender<Packet>>,
     compression: Box<dyn Compression>,
 }
 
-impl CompressedChunkReceiver {
+impl CompressedPacketReceiver {
     pub fn new(
-        receiver: mpsc::Receiver<Chunk>,
-        senders: Vec<mpsc::Sender<Chunk>>,
+        receiver: mpsc::Receiver<Packet>,
+        senders: Vec<mpsc::Sender<Packet>>,
         compression: Box<dyn Compression>,
     ) -> Self {
         Self {
@@ -23,19 +23,19 @@ impl CompressedChunkReceiver {
     }
 
     pub async fn run(&mut self) {
-        while let Some(chunk) = self.receiver.recv().await {
-            let compressed_chunk = self.compression.decompress(&chunk.content);
+        while let Some(packet) = self.receiver.recv().await {
+            let compressed_packet = self.compression.decompress(&packet.content);
             for sender in &self.senders {
                 if let Err(err) = sender
-                    .send(Chunk {
-                        stream_id: chunk.stream_id,
-                        sequence_number: chunk.sequence_number,
-                        timestamp: chunk.timestamp,
-                        content: Bytes::from(compressed_chunk.clone()),
+                    .send(Packet {
+                        stream_id: packet.stream_id,
+                        sequence_number: packet.sequence_number,
+                        timestamp: packet.timestamp,
+                        content: Bytes::from(compressed_packet.clone()),
                     })
                     .await
                 {
-                    tracing::debug!("Failed to send compressed chunk: {}", err);
+                    tracing::debug!("Failed to send compressed packet: {}", err);
                 }
             }
         }

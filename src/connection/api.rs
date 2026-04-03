@@ -261,7 +261,7 @@ impl IncomingProtofishConnection {
             .send(ConnectionMessage::ServerHello(server_hello))
             .await?;
 
-        let datagram_router = crate::datagram::router::DatagramChunkRouter::new(
+        let datagram_router = crate::datagram::router::DatagramPacketRouter::new(
             self.server_config
                 .protofish_config
                 .mani_config
@@ -457,7 +457,7 @@ impl ProtofishClient {
             }
         };
 
-        let datagram_router = crate::datagram::router::DatagramChunkRouter::new(
+        let datagram_router = crate::datagram::router::DatagramPacketRouter::new(
             self.config
                 .protofish_config
                 .mani_config
@@ -520,7 +520,7 @@ pub struct ConnectionState {
 pub struct ProtofishConnection {
     pub quic_conn: quinn::Connection,
     pub state: Arc<RwLock<ConnectionState>>,
-    pub datagram_router: crate::datagram::router::DatagramChunkRouter,
+    pub datagram_router: crate::datagram::router::DatagramPacketRouter,
     pub protofish_config: crate::config::ProtofishConfig,
 }
 

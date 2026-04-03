@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     ManiStreamId, SequenceNumber, Timestamp,
     compression::Compression,
-    datagram::chunk::{Chunk, serialize_chunk},
+    datagram::packet::{Packet, serialize_packet},
     mani::message::TransferMode,
 };
 
@@ -58,7 +58,7 @@ pub struct TransferSendStream {
     compression: Box<dyn Compression>,
     quic_connection: quinn::Connection,
     sequence_counter: SequenceNumber,
-    retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
+    retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
     max_retransmission_buffer_size: usize,
     command_sender: Option<mpsc::Sender<TransferSendCommand>>,
 }
@@ -74,7 +74,7 @@ impl TransferSendStream {
         initial_sequence_number: SequenceNumber,
         max_retransmission_buffer_size: usize,
         command_sender: mpsc::Sender<TransferSendCommand>,
-        retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
     ) -> Self {
         Self {
             id,
@@ -116,14 +116,14 @@ impl TransferSendStream {
 
         let compressed_content = self.compression.compress(&content);
 
-        let chunk = Chunk {
+        let packet = Packet {
             stream_id: self.id,
             sequence_number: self.sequence_counter,
             timestamp,
             content: Bytes::from(compressed_content),
         };
 
-        let serialized = serialize_chunk(&chunk);
+        let serialized = serialize_packet(&packet);
 
         self.quic_connection
             .send_datagram(serialized)
@@ -131,7 +131,7 @@ impl TransferSendStream {
 
         if self.mode == TransferMode::Dual {
             self.retransmission_buffer
-                .insert(self.sequence_counter, chunk);
+                .insert(self.sequence_counter, packet);
         }
 
         self.sequence_counter = SequenceNumber(self.sequence_counter.0.wrapping_add(1));

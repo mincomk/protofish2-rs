@@ -9,12 +9,12 @@ use tokio::sync::{mpsc::Receiver, oneshot};
 use crate::{
     ManiStreamId, SequenceNumber,
     compression::CompressionType,
-    datagram::{chunk::Chunk, router::DatagramChunkRouter},
+    datagram::{packet::Packet, router::DatagramPacketRouter},
     mani::{
         frame::{ManiReadFrame, ManiWriteFrame},
         message::{ManiMessage, ManiNack, TransferError, TransferErrorCode, TransferMode},
         transfer::{
-            compression::CompressedChunkReceiver,
+            compression::CompressedPacketReceiver,
             recv::{
                 RecvPipelineCommand, TransferReliableRecvStream, TransferUnreliableRecvStream,
                 create_stream_pair,
@@ -27,11 +27,11 @@ use crate::{
 enum ManiStreamRole {
     Unknown,
     Sender {
-        retransmission_buffer: Arc<DashMap<SequenceNumber, Chunk>>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
         transfer_end_ack_sender: Option<oneshot::Sender<()>>,
     },
     Receiver {
-        retrans_chunk_sender: Sender<Chunk>,
+        retrans_packet_sender: Sender<Packet>,
         pipeline_command_sender: Option<Sender<RecvPipelineCommand>>,
     },
 }
@@ -99,7 +99,7 @@ pub(crate) struct ManiStreamTask {
     pub reader: ManiReadFrame<quinn::RecvStream>,
 
     pub message_sender: Sender<ManiRecvMessage>,
-    pub datagram_router: DatagramChunkRouter,
+    pub datagram_router: DatagramPacketRouter,
 
     pub quic_connection: quinn::Connection,
     role: ManiStreamRole,
@@ -383,7 +383,7 @@ impl ManiStreamTask {
                 let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1);
 
                 let mut compression_receiver =
-                    CompressedChunkReceiver::new(dg_receiver, vec![s1, s2], compression);
+                    CompressedPacketReceiver::new(dg_receiver, vec![s1, s2], compression);
 
                 tokio::spawn(async move {
                     compression_receiver.run().await;
@@ -399,7 +399,7 @@ impl ManiStreamTask {
                 );
 
                 self.role = ManiStreamRole::Receiver {
-                    retrans_chunk_sender: dg_sender,
+                    retrans_packet_sender: dg_sender,
                     pipeline_command_sender: Some(pipeline_tx),
                 };
 
@@ -408,7 +408,7 @@ impl ManiStreamTask {
                 let (s1, r1) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
 
                 let mut compression_receiver =
-                    CompressedChunkReceiver::new(dg_receiver, vec![s1], compression);
+                    CompressedPacketReceiver::new(dg_receiver, vec![s1], compression);
 
                 tokio::spawn(async move {
                     compression_receiver.run().await;
@@ -417,7 +417,7 @@ impl ManiStreamTask {
                 let unrel = TransferUnreliableRecvStream::new(self.id, r1);
 
                 self.role = ManiStreamRole::Receiver {
-                    retrans_chunk_sender: dg_sender,
+                    retrans_packet_sender: dg_sender,
                     pipeline_command_sender: None,
                 };
 
@@ -478,11 +478,11 @@ impl ManiStreamTask {
                     .sequence_numbers
                     .iter()
                     .filter_map(|seq_num| {
-                        retransmission_buffer.get(seq_num).map(|chunk| {
+                        retransmission_buffer.get(seq_num).map(|packet| {
                             crate::mani::message::ManiRetrans {
                                 sequence_number: *seq_num,
-                                timestamp: chunk.value().timestamp,
-                                payload: chunk.value().content.clone(),
+                                timestamp: packet.value().timestamp,
+                                payload: packet.value().content.clone(),
                             }
                         })
                     })
@@ -527,17 +527,17 @@ impl ManiStreamTask {
     async fn handle_retrans(&mut self, retrans: crate::mani::message::ManiRetrans) -> bool {
         match &self.role {
             ManiStreamRole::Receiver {
-                retrans_chunk_sender,
+                retrans_packet_sender,
                 ..
             } => {
-                let chunk = Chunk {
+                let packet = Packet {
                     stream_id: self.id,
                     sequence_number: retrans.sequence_number,
                     timestamp: retrans.timestamp,
                     content: retrans.payload,
                 };
 
-                if let Err(err) = retrans_chunk_sender.send(chunk).await {
+                if let Err(err) = retrans_packet_sender.send(packet).await {
                     tracing::debug!(
                         "Failed to send retransmitted chunk to pipeline on stream {}: {}",
                         self.id,
@@ -699,7 +699,7 @@ impl ManiStream {
         quic_connection: quinn::Connection,
         writer: ManiWriteFrame<quinn::SendStream>,
         reader: ManiReadFrame<quinn::RecvStream>,
-        datagram_router: DatagramChunkRouter,
+        datagram_router: DatagramPacketRouter,
         max_retransmission_buffer_size: usize,
         max_nack_channel_size: usize,
         max_datagram_channel_size: usize,
@@ -923,7 +923,7 @@ mod tests {
         let (cmd_tx, _) = tokio::sync::mpsc::channel(1);
 
         let receiver_role = ManiStreamRole::Receiver {
-            retrans_chunk_sender: dg_tx,
+            retrans_packet_sender: dg_tx,
             pipeline_command_sender: Some(cmd_tx),
         };
         assert!(matches!(receiver_role, ManiStreamRole::Receiver { .. }));

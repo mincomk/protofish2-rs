@@ -2,7 +2,7 @@ use std::{collections::VecDeque, task::Waker};
 
 use thiserror::Error;
 
-use crate::{SequenceNumber, datagram::chunk::Chunk};
+use crate::{datagram::packet::Packet, SequenceNumber};
 
 #[derive(Error, Debug, Clone)]
 pub enum AssemblerError {
@@ -10,14 +10,14 @@ pub enum AssemblerError {
     RetransmissionBufferOverflow,
 }
 
-enum AssemblerChunk {
-    Payload(Chunk),
+enum AssemblerPacket {
+    Payload(Packet),
     Missing,
 }
 
 pub struct Assembler {
     cursor: SequenceNumber,
-    chunks: VecDeque<AssemblerChunk>,
+    packets: VecDeque<AssemblerPacket>,
     waker: Option<Waker>,
 
     max_retransmission_buffer_size: usize,
@@ -27,7 +27,7 @@ impl Assembler {
     pub fn new(max_retransmission_buffer_size: usize) -> Self {
         Self {
             cursor: 0.into(),
-            chunks: VecDeque::with_capacity(max_retransmission_buffer_size),
+            packets: VecDeque::with_capacity(max_retransmission_buffer_size),
             waker: None,
 
             max_retransmission_buffer_size,
@@ -37,9 +37,9 @@ impl Assembler {
     pub fn push(
         &mut self,
         sequence_number: SequenceNumber,
-        payload: Chunk,
+        payload: Packet,
     ) -> Result<(), AssemblerError> {
-        if self.chunks.len() >= self.max_retransmission_buffer_size {
+        if self.packets.len() >= self.max_retransmission_buffer_size {
             tracing::warn!(
                 "Retransmission buffer overflow, dropping payload with sequence number {}",
                 sequence_number
@@ -48,15 +48,15 @@ impl Assembler {
         }
 
         if let Some(index) = self.index(sequence_number) {
-            if let AssemblerChunk::Missing = self.chunks[index] {
-                self.chunks[index] = AssemblerChunk::Missing;
+            if let AssemblerPacket::Missing = self.packets[index] {
+                self.packets[index] = AssemblerPacket::Payload(payload);
             }
         } else {
-            let missing_chunks = sequence_number - self.cursor;
-            for _ in 0..missing_chunks.into() {
-                self.chunks.push_back(AssemblerChunk::Missing);
+            let missing_packets = sequence_number - self.cursor;
+            for _ in 0..missing_packets.into() {
+                self.packets.push_back(AssemblerPacket::Missing);
             }
-            self.chunks.push_back(AssemblerChunk::Payload(payload));
+            self.packets.push_back(AssemblerPacket::Payload(payload));
         }
 
         if let Some(waker) = self.waker.take() {
@@ -66,27 +66,27 @@ impl Assembler {
         Ok(())
     }
 
-    pub fn read_ordered(&mut self) -> Vec<Chunk> {
+    pub fn read_ordered(&mut self) -> Vec<Packet> {
         let mut payloads = Vec::new();
-        while let Some(chunk) = self.chunks.front() {
-            match chunk {
-                AssemblerChunk::Payload(payload) => {
+        while let Some(packet) = self.packets.front() {
+            match packet {
+                AssemblerPacket::Payload(payload) => {
                     payloads.push(payload.clone());
-                    self.chunks.pop_front();
+                    self.packets.pop_front();
                     self.cursor = self.cursor + 1.into();
                 }
-                AssemblerChunk::Missing => break,
+                AssemblerPacket::Missing => break,
             }
         }
         payloads
     }
 
     pub fn missing_sequence_numbers(&self) -> Vec<SequenceNumber> {
-        self.chunks
+        self.packets
             .iter()
             .enumerate()
-            .filter_map(|(index, chunk)| {
-                if let AssemblerChunk::Missing = chunk {
+            .filter_map(|(index, packet)| {
+                if let AssemblerPacket::Missing = packet {
                     Some(self.cursor + SequenceNumber(index as u32))
                 } else {
                     None
@@ -110,7 +110,7 @@ impl Assembler {
             return None;
         }
         let index = u32::from(sequence_number - self.cursor) as usize;
-        if index >= self.chunks.len() {
+        if index >= self.packets.len() {
             return None;
         }
         Some(index)

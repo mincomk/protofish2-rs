@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use derive_more::{Add, Display, From, Into, Sub};
 
 /// Unique identifier for a MANI stream within a connection.
@@ -51,3 +52,19 @@ pub struct SequenceNumber(pub u32);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Timestamp(pub u64);
+
+/// Public-facing chunk of data.
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub timestamp: Timestamp,
+    pub content: Bytes,
+}
+
+impl From<crate::datagram::packet::Packet> for Chunk {
+    fn from(packet: crate::datagram::packet::Packet) -> Self {
+        Self {
+            timestamp: packet.timestamp,
+            content: packet.content,
+        }
+    }
+}

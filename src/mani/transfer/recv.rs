@@ -1,5 +1,5 @@
 use crate::{
-    ManiStreamId, SequenceNumber, datagram::chunk::Chunk, mani::transfer::assembler::Assembler,
+    Chunk, ManiStreamId, SequenceNumber, datagram::packet::Packet, mani::transfer::assembler::Assembler,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -16,7 +16,7 @@ pub(crate) enum RecvPipelineCommand {
 pub struct TransferReliableRecvStream {
     pub id: ManiStreamId,
 
-    receiver: Receiver<Chunk>,
+    receiver: Receiver<Packet>,
     nack_sender: Sender<Vec<SequenceNumber>>,
     assembler: Assembler,
 
@@ -27,13 +27,13 @@ pub struct TransferReliableRecvStream {
 pub struct TransferUnreliableRecvStream {
     pub id: ManiStreamId,
 
-    receiver: Receiver<Chunk>,
+    receiver: Receiver<Packet>,
 }
 
 impl TransferReliableRecvStream {
     pub(crate) fn new(
         id: ManiStreamId,
-        receiver: Receiver<Chunk>,
+        receiver: Receiver<Packet>,
         nack_sender: Sender<Vec<SequenceNumber>>,
         max_retransmission_buffer_size: usize,
         command_receiver: Receiver<RecvPipelineCommand>,
@@ -67,15 +67,15 @@ impl TransferReliableRecvStream {
                         }
                     }
                 }
-                chunk_opt = self.receiver.recv() => {
-                    let chunk = match chunk_opt {
+                packet_opt = self.receiver.recv() => {
+                    let packet = match packet_opt {
                         Some(c) => c,
                         None => return None,
                     };
-                    let sequence_number = chunk.sequence_number;
-                    if let Err(err) = self.assembler.push(chunk.sequence_number, chunk) {
+                    let sequence_number = packet.sequence_number;
+                    if let Err(err) = self.assembler.push(packet.sequence_number, packet) {
                         tracing::error!(
-                            "Failed to push chunk with sequence number {} to assembler: {}",
+                            "Failed to push packet with sequence number {} to assembler: {}",
                             sequence_number,
                             err
                         );
@@ -89,9 +89,9 @@ impl TransferReliableRecvStream {
                         }
                     }
 
-                    let chunks = self.assembler.read_ordered();
-                    if !chunks.is_empty() {
-                        return Some(chunks);
+                    let packets = self.assembler.read_ordered();
+                    if !packets.is_empty() {
+                        return Some(packets.into_iter().map(Into::into).collect());
                     }
                 }
             }
@@ -100,19 +100,19 @@ impl TransferReliableRecvStream {
 }
 
 impl TransferUnreliableRecvStream {
-    pub(crate) fn new(id: ManiStreamId, receiver: Receiver<Chunk>) -> Self {
+    pub(crate) fn new(id: ManiStreamId, receiver: Receiver<Packet>) -> Self {
         Self { id, receiver }
     }
 
     pub async fn recv(&mut self) -> Option<Chunk> {
-        self.receiver.recv().await
+        self.receiver.recv().await.map(Into::into)
     }
 }
 
 pub(crate) fn create_stream_pair(
     id: ManiStreamId,
-    receiver1: Receiver<Chunk>,
-    receiver2: Receiver<Chunk>,
+    receiver1: Receiver<Packet>,
+    receiver2: Receiver<Packet>,
     nack_sender: Sender<Vec<SequenceNumber>>,
     max_retransmission_buffer_size: usize,
     command_receiver: Receiver<RecvPipelineCommand>,
