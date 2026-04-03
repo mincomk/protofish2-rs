@@ -110,7 +110,9 @@ impl TransferSendStream {
         timestamp: Timestamp,
         content: Bytes,
     ) -> Result<(), TransferSendError> {
-        if self.mode == TransferMode::Dual && self.retransmission_buffer.len() >= self.max_retransmission_buffer_size {
+        if self.mode == TransferMode::Dual
+            && self.retransmission_buffer.len() >= self.max_retransmission_buffer_size
+        {
             return Err(TransferSendError::RetransmissionBufferFull);
         }
 

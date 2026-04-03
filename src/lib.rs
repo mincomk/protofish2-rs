@@ -84,8 +84,8 @@ pub mod config;
 pub mod error;
 
 pub mod types;
-pub use types::*;
 pub use mani::message::TransferMode;
 pub use mani::stream::ManiTransferRecvStreams;
+pub use types::*;
 
 mod datagram;

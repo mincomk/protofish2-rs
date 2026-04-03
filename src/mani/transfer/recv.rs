@@ -1,5 +1,6 @@
 use crate::{
-    Chunk, ManiStreamId, SequenceNumber, datagram::packet::Packet, mani::transfer::assembler::Assembler,
+    Chunk, ManiStreamId, SequenceNumber, datagram::packet::Packet,
+    mani::transfer::assembler::Assembler,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},

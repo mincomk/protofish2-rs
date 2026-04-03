@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::{compression::CompressionType, SequenceNumber, Timestamp};
+use crate::{SequenceNumber, Timestamp, compression::CompressionType};
 
 #[derive(Debug, Clone)]
 pub struct ManiHello {

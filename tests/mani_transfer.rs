@@ -78,8 +78,13 @@ async fn test_mani_and_transfer() {
             .expect("Failed to accept transfer");
 
         let (mut reliable_recv, _unreliable_recv) = match streams {
-            protofish2::ManiTransferRecvStreams::Dual { reliable, unreliable } => (reliable, unreliable),
-            protofish2::ManiTransferRecvStreams::UnreliableOnly { .. } => panic!("Expected dual streams"),
+            protofish2::ManiTransferRecvStreams::Dual {
+                reliable,
+                unreliable,
+            } => (reliable, unreliable),
+            protofish2::ManiTransferRecvStreams::UnreliableOnly { .. } => {
+                panic!("Expected dual streams")
+            }
         };
 
         let mut received_chunks = 0;
@@ -121,7 +126,12 @@ async fn test_mani_and_transfer() {
 
     // Start transfer
     let mut send_stream = mani_stream
-        .start_transfer(protofish2::TransferMode::Dual, CompressionType::None, protofish2::SequenceNumber(0), None)
+        .start_transfer(
+            protofish2::TransferMode::Dual,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
         .await
         .expect("Failed to start transfer");
 
@@ -169,13 +179,21 @@ async fn test_unreliable_only_transfer() {
     let server_task = tokio::spawn(async move {
         let incoming = server.accept().await.expect("No incoming connection");
         let mut server_conn = incoming.accept().await.expect("Server failed to accept");
-        let mut mani_stream = server_conn.accept_mani().await.expect("Failed to accept mani stream");
+        let mut mani_stream = server_conn
+            .accept_mani()
+            .await
+            .expect("Failed to accept mani stream");
 
-        let streams = mani_stream.accept_transfer().await.expect("Failed to accept transfer");
+        let streams = mani_stream
+            .accept_transfer()
+            .await
+            .expect("Failed to accept transfer");
 
         let mut unreliable_recv = match streams {
             protofish2::ManiTransferRecvStreams::UnreliableOnly { unreliable } => unreliable,
-            protofish2::ManiTransferRecvStreams::Dual { .. } => panic!("Expected unreliable only stream"),
+            protofish2::ManiTransferRecvStreams::Dual { .. } => {
+                panic!("Expected unreliable only stream")
+            }
         };
 
         let mut received_chunks = 0;
@@ -198,10 +216,18 @@ async fn test_unreliable_only_transfer() {
         .await
         .expect("Client failed to connect and handshake");
 
-    let mut mani_stream = client_conn.open_mani().await.expect("Failed to open mani stream");
+    let mut mani_stream = client_conn
+        .open_mani()
+        .await
+        .expect("Failed to open mani stream");
 
     let mut send_stream = mani_stream
-        .start_transfer(protofish2::TransferMode::UnreliableOnly, CompressionType::None, protofish2::SequenceNumber(0), None)
+        .start_transfer(
+            protofish2::TransferMode::UnreliableOnly,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
         .await
         .expect("Failed to start transfer");
 

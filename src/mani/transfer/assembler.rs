@@ -2,7 +2,7 @@ use std::{collections::VecDeque, task::Waker};
 
 use thiserror::Error;
 
-use crate::{datagram::packet::Packet, SequenceNumber};
+use crate::{SequenceNumber, datagram::packet::Packet};
 
 #[derive(Error, Debug, Clone)]
 pub enum AssemblerError {

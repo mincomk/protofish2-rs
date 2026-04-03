@@ -403,7 +403,10 @@ impl ManiStreamTask {
                     pipeline_command_sender: Some(pipeline_tx),
                 };
 
-                ManiTransferRecvStreams::Dual { reliable: rel, unreliable: unrel }
+                ManiTransferRecvStreams::Dual {
+                    reliable: rel,
+                    unreliable: unrel,
+                }
             } else {
                 let (s1, r1) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
 
@@ -473,21 +476,19 @@ impl ManiStreamTask {
             ManiStreamRole::Sender {
                 retransmission_buffer,
                 ..
-            } => {
-                nack
-                    .sequence_numbers
-                    .iter()
-                    .filter_map(|seq_num| {
-                        retransmission_buffer.get(seq_num).map(|packet| {
-                            crate::mani::message::ManiRetrans {
-                                sequence_number: *seq_num,
-                                timestamp: packet.value().timestamp,
-                                payload: packet.value().content.clone(),
-                            }
-                        })
+            } => nack
+                .sequence_numbers
+                .iter()
+                .filter_map(|seq_num| {
+                    retransmission_buffer.get(seq_num).map(|packet| {
+                        crate::mani::message::ManiRetrans {
+                            sequence_number: *seq_num,
+                            timestamp: packet.value().timestamp,
+                            payload: packet.value().content.clone(),
+                        }
                     })
-                    .collect()
-            }
+                })
+                .collect(),
             _ => {
                 tracing::debug!("Received NACK on stream {} but not in Sender role", self.id);
                 return true;
@@ -780,9 +781,7 @@ impl ManiStream {
     /// ```ignore
     /// let (reliable, unreliable) = stream.accept_transfer().await?;
     /// ```
-    pub async fn accept_transfer(
-        &mut self,
-    ) -> Result<ManiTransferRecvStreams, ManiStreamError> {
+    pub async fn accept_transfer(&mut self) -> Result<ManiTransferRecvStreams, ManiStreamError> {
         match self.recv().await {
             Some(ManiRecvMessage::Transfer(streams)) => Ok(streams),
             Some(ManiRecvMessage::Payload(_)) => Err(ManiStreamError::ExpectedTransfer),
