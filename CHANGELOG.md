@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0]
+### Added
+- Added reconnection logic.
+
+### Changed
+- Changed QUIC-side error to more verbose.
+
 ## [0.4.0]
 ### Added
 - Added backpressure handling.
