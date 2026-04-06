@@ -138,20 +138,24 @@ impl TransferUnreliableRecvStream {
     }
 
     pub async fn recv(&mut self) -> Option<Chunk> {
-        if self.is_end.load(std::sync::atomic::Ordering::SeqCst) && self.receiver.is_empty() {
-            return None; // Signal EOF
-        }
-
-        tokio::select! {
-            _ = self.end_receiver.notified() => {
-                None // Signal EOF
+        loop {
+            if self.is_end.load(std::sync::atomic::Ordering::SeqCst) && self.receiver.is_empty() {
+                return None; // Signal EOF
             }
-            packet_opt =  self.receiver.recv() => {
-                let packet = match packet_opt {
-                    Some(c) => c,
-                    None => return None,
-                };
-                Some(packet.into())
+
+            tokio::select! {
+                _ = self.end_receiver.notified() => {
+                    if self.is_end.load(std::sync::atomic::Ordering::SeqCst) && self.receiver.is_empty() {
+                        return None; // Signal EOF
+                    }
+                }
+                packet_opt =  self.receiver.recv() => {
+                    let packet = match packet_opt {
+                        Some(c) => c,
+                        None => return None,
+                    };
+                    return Some(packet.into());
+                }
             }
         }
     }
