@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::{
     Chunk, ManiStreamId, SequenceNumber, datagram::packet::Packet,
@@ -118,23 +118,30 @@ pub struct TransferUnreliableRecvStream {
     pub id: ManiStreamId,
 
     end_receiver: Arc<Notify>,
+    is_end: Arc<AtomicBool>,
     receiver: Receiver<Packet>,
 }
 
 impl TransferUnreliableRecvStream {
     pub(crate) async fn new(
         id: ManiStreamId,
+        is_end: Arc<AtomicBool>,
         receiver: Receiver<Packet>,
         end_receiver: Arc<Notify>,
     ) -> Self {
         Self {
             id,
             receiver,
+            is_end,
             end_receiver,
         }
     }
 
     pub async fn recv(&mut self) -> Option<Chunk> {
+        if self.is_end.load(std::sync::atomic::Ordering::SeqCst) && self.receiver.is_empty() {
+            return None; // Signal EOF
+        }
+
         tokio::select! {
             _ = self.end_receiver.notified() => {
                 None // Signal EOF
@@ -155,6 +162,7 @@ pub(crate) async fn create_stream_pair(
     receiver1: Receiver<Packet>,
     receiver2: Receiver<Packet>,
     end_receiver: Arc<Notify>,
+    is_end: Arc<AtomicBool>,
     sender_command_sender: Sender<RecvSenderCommand>,
     max_retransmission_buffer_size: usize,
     command_receiver: Receiver<RecvPipelineCommand>,
@@ -167,12 +175,8 @@ pub(crate) async fn create_stream_pair(
         command_receiver,
         sender_command_sender.clone(),
     );
-    let unreliable_stream = TransferUnreliableRecvStream::new(
-        id,
-        receiver2,
-        end_receiver,
-    )
-    .await;
+    let unreliable_stream =
+        TransferUnreliableRecvStream::new(id, is_end, receiver2, end_receiver).await;
 
     (reliable_stream, unreliable_stream)
 }

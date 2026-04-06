@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             channels: 2,
             sample_rate: 48000,
             bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: hound::SampleFormat::Float,
         };
         let mut writer =
             WavWriter::create(Path::new(&output_path), spec).expect("Failed to create WAV writer");

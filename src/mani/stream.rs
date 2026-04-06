@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc::Sender};
 
@@ -115,6 +115,7 @@ pub(crate) struct ManiStreamTask {
     sender_command_sender: Sender<RecvSenderCommand>,
     sender_command_receiver: Receiver<RecvSenderCommand>,
     end_notify: Arc<Notify>,
+    is_ended: Arc<AtomicBool>,
 
     backpressure_bank: BackpressureBank,
 }
@@ -216,7 +217,7 @@ impl ManiStreamTask {
                 true
             }
             TransferSendCommand::SendTransferEndAck => {
-                self.end_notify.notify_waiters();
+                self.end();
                 if let Err(err) = self.writer.write_frame(&ManiMessage::TransferEndAck).await {
                     tracing::debug!(
                         "Failed to send TransferEndAck on stream {}: {}",
@@ -228,6 +229,11 @@ impl ManiStreamTask {
                 true
             }
         }
+    }
+
+    fn end(&mut self) {
+        self.is_ended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn handle_command(&mut self, command: ManiStreamCommand) -> bool {
@@ -458,6 +464,7 @@ impl ManiStreamTask {
                     r1,
                     r2,
                     self.end_notify.clone(),
+                    self.is_ended.clone(),
                     self.sender_command_sender.clone(),
                     self.max_retransmission_buffer_size,
                     pipeline_rx,
@@ -488,8 +495,13 @@ impl ManiStreamTask {
                     compression_receiver.run().await;
                 });
 
-                let unrel =
-                    TransferUnreliableRecvStream::new(self.id, r1, self.end_notify.clone()).await;
+                let unrel = TransferUnreliableRecvStream::new(
+                    self.id,
+                    self.is_ended.clone(),
+                    r1,
+                    self.end_notify.clone(),
+                )
+                .await;
 
                 self.role = ManiStreamRole::Receiver {
                     retrans_packet_sender: dg_sender,
@@ -673,7 +685,9 @@ impl ManiStreamTask {
                     });
                 } else {
                     // No pipeline to flush, acknowledge immediately
-                    self.end_notify.notify_waiters();
+
+                    self.end();
+
                     if let Err(err) = self.writer.write_frame(&ManiMessage::TransferEndAck).await {
                         tracing::debug!(
                             "Failed to send TransferEndAck on stream {}: {}",
@@ -805,6 +819,7 @@ impl ManiStream {
             quic_connection,
             role: ManiStreamRole::Unknown,
             end_notify: Arc::new(Notify::new()),
+            is_ended: Arc::new(AtomicBool::new(false)),
             command_receiver,
             transfer_send_command_receiver,
             transfer_send_command_sender,

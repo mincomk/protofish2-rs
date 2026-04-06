@@ -39,7 +39,7 @@ impl OpusJitterBuffer {
         })
     }
 
-    pub async fn yield_pcm(&mut self) -> Result<Option<Vec<i16>>, opus::Error> {
+    pub async fn yield_pcm(&mut self) -> Result<Option<Vec<f32>>, opus::Error> {
         loop {
             // Buffer management
             if let Some(next_play_ts) = self.next_play_ts {
@@ -48,28 +48,23 @@ impl OpusJitterBuffer {
                 if self.buffer.contains_key(&next_play_ts) {
                     let chunk = self.buffer.remove(&next_play_ts).unwrap();
                     let max_samples = 5760 * self.channels as usize;
-                    let mut pcm = vec![0i16; max_samples];
-                    let decoded_len = self.decoder.decode(&chunk, &mut pcm, false)?;
+                    let mut pcm = vec![0f32; max_samples];
+                    let decoded_len = self.decoder.decode_float(&chunk, &mut pcm, false)?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));
-                } else if max_ts.saturating_sub(next_play_ts) >= self.playout_delay_ms
-                    || (self.buffer.is_empty() && self.is_eof)
+                } else if self.is_eof || max_ts.saturating_sub(next_play_ts) >= self.playout_delay_ms
                 {
                     if self.buffer.is_empty() && self.is_eof {
                         return Ok(None); // Stop if EOF and empty
                     }
                     let max_samples = 5760 * self.channels as usize;
-                    let mut pcm = vec![0i16; max_samples];
-                    let decoded_len = self.decoder.decode(&[], &mut pcm, true)?;
+                    let mut pcm = vec![0f32; max_samples];
+                    let decoded_len = self.decoder.decode_float(&[], &mut pcm, true)?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));
                 }
-            }
-
-            if self.is_eof {
-                return Ok(None);
             }
 
             // Receive next chunk
@@ -83,7 +78,6 @@ impl OpusJitterBuffer {
                 }
                 None => {
                     self.is_eof = true;
-                    return Ok(None);
                 }
             }
         }
