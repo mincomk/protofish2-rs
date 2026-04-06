@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0]
+### Fixed
+- Fixed ending transfer stream logic.
+
 ## [0.5.0]
 ### Added
 - Added reconnection logic.
