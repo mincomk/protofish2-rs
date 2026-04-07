@@ -662,12 +662,14 @@ impl ProtofishConnection {
                 .max_retransmission_buffer_size,
             self.protofish_config.mani_config.max_nack_channel_size,
             self.protofish_config.mani_config.max_datagram_channel_size,
+            self.protofish_config.mani_config.max_chunk_buffer_size,
             self.protofish_config
                 .mani_config
                 .initial_backpressure_credits,
             self.protofish_config
                 .mani_config
                 .backpressure_credit_batch_size,
+            self.protofish_config.mani_config.max_datagram_size,
         );
 
         tokio::spawn(async move {
@@ -719,12 +721,14 @@ impl ProtofishConnection {
                 .max_retransmission_buffer_size,
             self.protofish_config.mani_config.max_nack_channel_size,
             self.protofish_config.mani_config.max_datagram_channel_size,
+            self.protofish_config.mani_config.max_chunk_buffer_size,
             self.protofish_config
                 .mani_config
                 .initial_backpressure_credits,
             self.protofish_config
                 .mani_config
                 .backpressure_credit_batch_size,
+            self.protofish_config.mani_config.max_datagram_size,
         );
 
         tokio::spawn(async move {

@@ -8,7 +8,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     ManiStreamId, SequenceNumber, Timestamp,
     compression::Compression,
-    datagram::packet::{Packet, serialize_packet},
+    datagram::packet::{
+        FRAG_CONTENT_OVERHEAD, PACKET_WIRE_HEADER_SIZE, Packet, SINGLE_CONTENT_OVERHEAD,
+        encode_fragment_content, encode_single_content, serialize_packet,
+    },
     mani::{message::TransferMode, transfer::backpressure::BackpressureBank},
 };
 
@@ -58,10 +61,14 @@ pub struct TransferSendStream {
     compression: Box<dyn Compression>,
     quic_connection: quinn::Connection,
     sequence_counter: SequenceNumber,
-    retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
+    /// Each logical `send()` call occupies one sequence number.
+    /// For fragmented sends all fragment datagrams share that same sequence number.
+    retransmission_buffer: Arc<DashMap<SequenceNumber, Vec<Packet>>>,
     max_retransmission_buffer_size: usize,
     command_sender: Option<mpsc::Sender<TransferSendCommand>>,
     backpressure_bank: BackpressureBank,
+    /// Maximum QUIC datagram size in bytes. `None` disables fragmentation.
+    max_datagram_size: Option<usize>,
 }
 
 impl TransferSendStream {
@@ -75,8 +82,9 @@ impl TransferSendStream {
         initial_sequence_number: SequenceNumber,
         max_retransmission_buffer_size: usize,
         command_sender: mpsc::Sender<TransferSendCommand>,
-        retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Vec<Packet>>>,
         backpressure_bank: BackpressureBank,
+        max_datagram_size: Option<usize>,
     ) -> Self {
         Self {
             id,
@@ -88,6 +96,7 @@ impl TransferSendStream {
             max_retransmission_buffer_size,
             command_sender: Some(command_sender),
             backpressure_bank,
+            max_datagram_size,
         }
     }
 
@@ -112,38 +121,73 @@ impl TransferSendStream {
         timestamp: Timestamp,
         content: Bytes,
     ) -> Result<(), TransferSendError> {
-        let compressed_content = self.compression.compress(&content);
+        let compressed = Bytes::from(self.compression.compress(&content));
+        let seq = self.sequence_counter;
 
-        let packet = Packet {
-            stream_id: self.id,
-            sequence_number: self.sequence_counter,
-            timestamp,
-            content: Bytes::from(compressed_content),
+        let max_single_payload = self
+            .max_datagram_size
+            .map(|m| m.saturating_sub(PACKET_WIRE_HEADER_SIZE + SINGLE_CONTENT_OVERHEAD));
+
+        let max_frag_payload = self
+            .max_datagram_size
+            .map(|m| m.saturating_sub(PACKET_WIRE_HEADER_SIZE + FRAG_CONTENT_OVERHEAD));
+
+        let needs_fragment = max_single_payload
+            .map(|limit| compressed.len() > limit)
+            .unwrap_or(false);
+
+        // Build the list of packets for this logical send.
+        // All packets share the same sequence number `seq`.
+        let packets: Vec<Packet> = if needs_fragment {
+            let frag_size = max_frag_payload.unwrap();
+            let frags: Vec<&[u8]> = compressed.chunks(frag_size).collect();
+            let total_frags = frags.len() as u16;
+            frags
+                .into_iter()
+                .enumerate()
+                .map(|(i, frag)| Packet {
+                    stream_id: self.id,
+                    sequence_number: seq,
+                    timestamp,
+                    content: encode_fragment_content(i as u16, total_frags, frag),
+                })
+                .collect()
+        } else {
+            vec![Packet {
+                stream_id: self.id,
+                sequence_number: seq,
+                timestamp,
+                content: encode_single_content(compressed),
+            }]
         };
 
-        let serialized = serialize_packet(&packet);
+        // Send all datagrams on the wire.
+        for packet in &packets {
+            self.quic_connection
+                .send_datagram(serialize_packet(packet))
+                .map_err(|e| TransferSendError::DatagramSendFailed(e.to_string()))?;
+        }
 
-        self.quic_connection
-            .send_datagram(serialized)
-            .map_err(|e| TransferSendError::DatagramSendFailed(e.to_string()))?;
-
+        // Store in retransmission buffer (Dual mode only).
         if self.mode == TransferMode::Dual {
             if self.retransmission_buffer.len() >= self.max_retransmission_buffer_size {
                 let oldest_seq = SequenceNumber(
-                    self.sequence_counter
-                        .0
+                    seq.0
                         .wrapping_sub(self.max_retransmission_buffer_size as u32),
                 );
                 self.retransmission_buffer.remove(&oldest_seq);
             }
-            self.retransmission_buffer
-                .insert(self.sequence_counter, packet);
+            self.retransmission_buffer.insert(seq, packets.clone());
         }
 
-        self.sequence_counter = SequenceNumber(self.sequence_counter.0.wrapping_add(1));
+        // One sequence number per logical send.
+        self.sequence_counter = SequenceNumber(seq.0.wrapping_add(1));
 
-        self.backpressure_bank.wait_for_credit().await;
-        self.backpressure_bank.decrease_credits(1);
+        // Backpressure: one credit per datagram sent (credits are per-datagram, not per-send).
+        for _ in 0..packets.len() {
+            self.backpressure_bank.wait_for_credit().await;
+            self.backpressure_bank.decrease_credits(1);
+        }
 
         Ok(())
     }
@@ -171,6 +215,8 @@ impl TransferSendStream {
     /// Returns an error if the stream fails or if acknowledgment is not received
     /// within the timeout period (5 seconds).
     pub async fn end(&mut self) -> Result<(), TransferSendError> {
+        tracing::debug!("Ending transfer with stream ID {}", self.id.0);
+
         let final_sequence_number = SequenceNumber(self.sequence_counter.0.wrapping_sub(1));
 
         if let Some(command_sender) = &self.command_sender {

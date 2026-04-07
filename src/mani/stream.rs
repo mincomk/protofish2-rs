@@ -31,7 +31,7 @@ use crate::{
 enum ManiStreamRole {
     Unknown,
     Sender {
-        retransmission_buffer: Arc<DashMap<SequenceNumber, Packet>>,
+        retransmission_buffer: Arc<DashMap<SequenceNumber, Vec<Packet>>>,
         transfer_end_ack_sender: Option<oneshot::Sender<()>>,
     },
     Receiver {
@@ -98,7 +98,9 @@ pub(crate) struct ManiStreamTask {
     pub id: ManiStreamId,
     pub max_retransmission_buffer_size: usize,
     pub max_datagram_channel_size: usize,
+    pub max_chunk_buffer_size: usize,
     pub credits_bulk_update_count: usize,
+    pub max_datagram_size: Option<usize>,
 
     pub writer: ManiWriteFrame<quinn::SendStream>,
     pub reader: ManiReadFrame<quinn::RecvStream>,
@@ -234,6 +236,7 @@ impl ManiStreamTask {
     fn end(&mut self) {
         self.is_ended
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.end_notify.notify_waiters();
     }
 
     async fn handle_command(&mut self, command: ManiStreamCommand) -> bool {
@@ -373,12 +376,17 @@ impl ManiStreamTask {
             return Err(TransferSendError::DatagramSendFailed(err.to_string()));
         }
 
-        let retransmission_buffer = Arc::new(DashMap::new());
+        let retransmission_buffer: Arc<DashMap<SequenceNumber, Vec<Packet>>> =
+            Arc::new(DashMap::new());
 
         self.role = ManiStreamRole::Sender {
             retransmission_buffer: Arc::clone(&retransmission_buffer),
             transfer_end_ack_sender: None,
         };
+
+        let effective_max_datagram_size = self
+            .max_datagram_size
+            .or_else(|| self.quic_connection.max_datagram_size());
 
         Ok(TransferSendStream::new(
             self.id,
@@ -390,6 +398,7 @@ impl ManiStreamTask {
             self.transfer_send_command_sender.clone(),
             retransmission_buffer,
             self.backpressure_bank.clone(),
+            effective_max_datagram_size,
         ))
     }
 
@@ -453,6 +462,7 @@ impl ManiStreamTask {
                     compression,
                     self.sender_command_sender.clone(),
                     self.credits_bulk_update_count,
+                    self.max_chunk_buffer_size,
                 );
 
                 tokio::spawn(async move {
@@ -489,6 +499,7 @@ impl ManiStreamTask {
                     compression,
                     self.sender_command_sender.clone(),
                     self.credits_bulk_update_count,
+                    self.max_chunk_buffer_size,
                 );
 
                 tokio::spawn(async move {
@@ -556,23 +567,32 @@ impl ManiStreamTask {
     }
 
     async fn handle_nack(&mut self, nack: ManiNack) -> bool {
+        // Build one ManiRetrans per datagram (fragment) stored for each NACKed sequence number.
         let retrans_messages: Vec<_> = match &self.role {
             ManiStreamRole::Sender {
                 retransmission_buffer,
                 ..
-            } => nack
-                .sequence_numbers
-                .iter()
-                .filter_map(|seq_num| {
-                    retransmission_buffer.get(seq_num).map(|packet| {
-                        crate::mani::message::ManiRetrans {
-                            sequence_number: *seq_num,
-                            timestamp: packet.value().timestamp,
-                            payload: packet.value().content.clone(),
+            } => {
+                let mut msgs = Vec::new();
+                for seq_num in &nack.sequence_numbers {
+                    if let Some(packets) = retransmission_buffer.get(seq_num) {
+                        for packet in packets.value().iter() {
+                            msgs.push(crate::mani::message::ManiRetrans {
+                                sequence_number: *seq_num,
+                                timestamp: packet.timestamp,
+                                payload: packet.content.clone(),
+                            });
                         }
-                    })
-                })
-                .collect(),
+                    } else {
+                        tracing::warn!(
+                            "Cannot retransmit seq {} on stream {} - not in buffer",
+                            seq_num,
+                            self.id
+                        );
+                    }
+                }
+                msgs
+            }
             _ => {
                 tracing::debug!("Received NACK on stream {} but not in Sender role", self.id);
                 return true;
@@ -587,22 +607,6 @@ impl ManiStreamTask {
             {
                 tracing::debug!("Failed to send Retrans on stream {}: {}", self.id, err);
                 return false;
-            }
-        }
-
-        if let ManiStreamRole::Sender {
-            retransmission_buffer,
-            ..
-        } = &self.role
-        {
-            for seq_num in &nack.sequence_numbers {
-                if !retransmission_buffer.contains_key(seq_num) {
-                    tracing::warn!(
-                        "Cannot retransmit seq {} on stream {} - not in buffer",
-                        seq_num,
-                        self.id
-                    );
-                }
             }
         }
 
@@ -792,8 +796,10 @@ impl ManiStream {
         max_retransmission_buffer_size: usize,
         max_nack_channel_size: usize,
         max_datagram_channel_size: usize,
+        max_chunk_buffer_size: usize,
         initial_backpressure_credits: usize,
         credits_bulk_update_count: usize,
+        max_datagram_size: Option<usize>,
     ) -> (Self, ManiStreamTask) {
         let (message_sender, message_receiver) = tokio::sync::mpsc::channel(100);
         let (command_sender, command_receiver) = tokio::sync::mpsc::channel(100);
@@ -811,7 +817,9 @@ impl ManiStream {
             id,
             max_retransmission_buffer_size,
             max_datagram_channel_size,
+            max_chunk_buffer_size,
             credits_bulk_update_count,
+            max_datagram_size,
             writer,
             reader,
             message_sender,

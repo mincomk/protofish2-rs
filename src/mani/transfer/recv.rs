@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     Chunk, ManiStreamId, SequenceNumber, datagram::packet::Packet,
@@ -145,7 +148,7 @@ impl TransferUnreliableRecvStream {
 
             tokio::select! {
                 _ = self.end_receiver.notified() => {
-                    if self.is_end.load(std::sync::atomic::Ordering::SeqCst) && self.receiver.is_empty() {
+                    if self.is_end.load(Ordering::SeqCst) && self.receiver.is_empty() {
                         return None; // Signal EOF
                     }
                 }

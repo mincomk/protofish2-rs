@@ -40,6 +40,20 @@ pub struct ManiConfig {
 
     /// Increment of backpressure credits for receiver to send CreditUpdate
     pub backpressure_credit_batch_size: usize,
+
+    /// Maximum QUIC datagram size in bytes (including the packet wire header).
+    ///
+    /// When set, payloads that exceed this limit after compression are automatically
+    /// split into multiple datagrams and reassembled by the receiver.
+    ///
+    /// The usable payload per fragment is `max_datagram_size - 25` bytes (20-byte
+    /// packet wire header + 5-byte fragmentation header).
+    ///
+    /// When `None` (the default) the limit is taken from
+    /// [`quinn::Connection::max_datagram_size`] at the time each transfer starts,
+    /// so the path MTU is respected automatically.  Set to `Some(n)` to override
+    /// with a fixed value.
+    pub max_datagram_size: Option<usize>,
 }
 
 impl Default for ManiConfig {
@@ -53,6 +67,7 @@ impl Default for ManiConfig {
             pending_chunk_cleanup_interval: std::time::Duration::from_secs(1),
             initial_backpressure_credits: 100,
             backpressure_credit_batch_size: 10,
+            max_datagram_size: None,
         }
     }
 }

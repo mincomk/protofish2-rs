@@ -4,6 +4,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use protofish2::Timestamp;
 use protofish2::compression::CompressionType;
+use protofish2::config::ManiConfig;
 use protofish2::connection::{ClientConfig, ProtofishClient, ProtofishServer, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -250,6 +251,227 @@ async fn test_unreliable_only_transfer() {
             .await
             .expect("Failed to send chunk");
     }
+
+    send_stream.end().await.expect("Failed to end transfer");
+    server_task.await.unwrap();
+}
+
+/// Sends a 10 000-byte payload over a connection configured with a small
+/// `max_datagram_size` so that the payload must be split into multiple
+/// fragments and reassembled on the receive side.
+#[tokio::test]
+async fn test_fragmented_large_payload_dual() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (cert_chain, private_key) = generate_cert();
+
+    // 512-byte datagram limit → fragments of 512 - 29 = 483 bytes each.
+    // A 10 000-byte payload requires ceil(10000 / 483) = 21 fragments.
+    let mani_config = ManiConfig {
+        max_datagram_size: Some(512),
+        ..ManiConfig::default()
+    };
+    let protofish_config = protofish2::config::ProtofishConfig {
+        mani_config,
+        ..protofish2::config::ProtofishConfig::default()
+    };
+
+    let server_config = ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        cert_chain: cert_chain.clone(),
+        private_key,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_interval: Duration::from_secs(5),
+        protofish_config: protofish_config.clone(),
+    };
+
+    let server = ProtofishServer::bind(server_config).expect("Failed to bind server");
+    let server_addr = server.local_addr().unwrap();
+
+    let client_config = ClientConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        root_certificates: cert_chain,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_range: Duration::from_secs(1)..Duration::from_secs(10),
+        protofish_config,
+    };
+
+    let client = ProtofishClient::bind(client_config).expect("Failed to bind client");
+
+    // Build a 10 000-byte payload.
+    let large_payload: Bytes = Bytes::from(vec![0xABu8; 10_000]);
+    let expected = large_payload.clone();
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("No incoming connection");
+        let mut server_conn = incoming.accept().await.expect("Server failed to accept");
+        let mut mani_stream = server_conn
+            .accept_mani()
+            .await
+            .expect("Failed to accept stream");
+
+        let streams = mani_stream
+            .accept_transfer()
+            .await
+            .expect("Failed to accept transfer");
+        let (mut reliable_recv, mut unreliable_recv) = match streams {
+            protofish2::ManiTransferRecvStreams::Dual {
+                reliable,
+                unreliable,
+            } => (reliable, unreliable),
+            _ => panic!("Expected Dual streams"),
+        };
+
+        tokio::spawn(async move { while unreliable_recv.recv().await.is_some() {} });
+
+        // Drain the reliable receiver until EOF so the TransferEndAck handshake completes.
+        let mut all_chunks = Vec::new();
+        while let Some(chunks) = reliable_recv.recv().await {
+            all_chunks.extend(chunks);
+        }
+        assert_eq!(
+            all_chunks.len(),
+            1,
+            "Expected exactly one reassembled chunk"
+        );
+        assert_eq!(
+            all_chunks[0].content, expected,
+            "Reassembled content mismatch"
+        );
+        assert_eq!(all_chunks[0].timestamp, Timestamp(42));
+    });
+
+    let mut client_conn = client
+        .connect(server_addr, "localhost", HashMap::new())
+        .await
+        .expect("Client failed to connect");
+
+    let mut mani_stream = client_conn
+        .open_mani()
+        .await
+        .expect("Failed to open stream");
+    let mut send_stream = mani_stream
+        .start_transfer(
+            protofish2::TransferMode::Dual,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
+        .await
+        .expect("Failed to start transfer");
+
+    send_stream
+        .send(Timestamp(42), large_payload)
+        .await
+        .expect("Failed to send large payload");
+
+    send_stream.end().await.expect("Failed to end transfer");
+    server_task.await.unwrap();
+}
+
+/// Sends a 10 000-byte payload over a connection configured with a small
+/// `max_datagram_size` so that the payload must be split into multiple
+/// fragments and reassembled on the receive side.
+#[tokio::test]
+async fn test_fragmented_large_payload_unrel() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (cert_chain, private_key) = generate_cert();
+
+    // 512-byte datagram limit → fragments of 512 - 29 = 483 bytes each.
+    // A 10 000-byte payload requires ceil(10000 / 483) = 21 fragments.
+    let mani_config = ManiConfig {
+        max_datagram_size: Some(512),
+        ..ManiConfig::default()
+    };
+    let protofish_config = protofish2::config::ProtofishConfig {
+        mani_config,
+        ..protofish2::config::ProtofishConfig::default()
+    };
+
+    let server_config = ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        cert_chain: cert_chain.clone(),
+        private_key,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_interval: Duration::from_secs(5),
+        protofish_config: protofish_config.clone(),
+    };
+
+    let server = ProtofishServer::bind(server_config).expect("Failed to bind server");
+    let server_addr = server.local_addr().unwrap();
+
+    let client_config = ClientConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        root_certificates: cert_chain,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_range: Duration::from_secs(1)..Duration::from_secs(10),
+        protofish_config,
+    };
+
+    let client = ProtofishClient::bind(client_config).expect("Failed to bind client");
+
+    // Build a 10 000-byte payload.
+    let large_payload: Bytes = Bytes::from(vec![0xABu8; 10_000]);
+    let expected = large_payload.clone();
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("No incoming connection");
+        let mut server_conn = incoming.accept().await.expect("Server failed to accept");
+        let mut mani_stream = server_conn
+            .accept_mani()
+            .await
+            .expect("Failed to accept stream");
+
+        let streams = mani_stream
+            .accept_transfer()
+            .await
+            .expect("Failed to accept transfer");
+        let mut unreliable_recv = match streams {
+            protofish2::ManiTransferRecvStreams::UnreliableOnly { unreliable } => unreliable,
+            _ => panic!("Expected Dual streams"),
+        };
+
+        // Drain the reliable receiver until EOF so the TransferEndAck handshake completes.
+        let mut all_chunks = Vec::new();
+        while let Some(chunks) = unreliable_recv.recv().await {
+            all_chunks.push(chunks);
+        }
+        assert_eq!(
+            all_chunks.len(),
+            1,
+            "Expected exactly one reassembled chunk"
+        );
+        assert_eq!(
+            all_chunks[0].content, expected,
+            "Reassembled content mismatch"
+        );
+        assert_eq!(all_chunks[0].timestamp, Timestamp(42));
+    });
+
+    let mut client_conn = client
+        .connect(server_addr, "localhost", HashMap::new())
+        .await
+        .expect("Client failed to connect");
+
+    let mut mani_stream = client_conn
+        .open_mani()
+        .await
+        .expect("Failed to open stream");
+    let mut send_stream = mani_stream
+        .start_transfer(
+            protofish2::TransferMode::UnreliableOnly,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
+        .await
+        .expect("Failed to start transfer");
+
+    send_stream
+        .send(Timestamp(42), large_payload)
+        .await
+        .expect("Failed to send large payload");
 
     send_stream.end().await.expect("Failed to end transfer");
     server_task.await.unwrap();
