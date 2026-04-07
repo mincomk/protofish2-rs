@@ -77,6 +77,20 @@ pub struct ProtofishConfig {
 
     /// Configuration for the Mani reliable transfer layer.
     pub mani_config: ManiConfig,
+
+    /// Maximum duration allowed for the connection handshake to complete.
+    ///
+    /// If the peer does not finish the Protofish2 handshake (ClientHello / ServerHello
+    /// exchange) within this window, the connection attempt is aborted with
+    /// `ProtofishConnectionError::HandshakeTimeout`.
+    pub handshake_timeout: std::time::Duration,
+
+    /// Maximum duration of keepalive inactivity before the connection is closed.
+    ///
+    /// If no keepalive activity (Keepalive / KeepaliveAck) is observed within this window,
+    /// the connection is forcefully closed.  This replaces the previous hard-coded
+    /// `keepalive_interval * 3` heuristic.
+    pub keepalive_timeout: std::time::Duration,
 }
 
 /// Configuration for automatic reconnection behavior.
@@ -129,6 +143,8 @@ impl Default for ProtofishConfig {
         Self {
             retransmission_buffer_size: 1024,
             mani_config: ManiConfig::default(),
+            handshake_timeout: std::time::Duration::from_secs(4),
+            keepalive_timeout: std::time::Duration::from_secs(9),
         }
     }
 }

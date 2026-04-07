@@ -32,7 +32,9 @@ impl OpusDecoderStream {
                     // 120ms at 48kHz is 5760 samples per channel.
                     let max_samples = 5760 * self.channels as usize;
                     let mut pcm = vec![0i16; max_samples];
-                    let decoded_len = self.decoder.decode(&chunk.content, &mut pcm, false)?;
+                    let decoded_len = tokio::task::block_in_place(|| {
+                        self.decoder.decode(&chunk.content, &mut pcm, false)
+                    })?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     decoded_chunks.push(pcm);
                 }

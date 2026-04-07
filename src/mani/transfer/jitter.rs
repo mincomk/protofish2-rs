@@ -39,6 +39,13 @@ impl OpusJitterBuffer {
         })
     }
 
+    /// Yields the next decoded PCM frame.
+    ///
+    /// # Runtime requirement
+    ///
+    /// This method uses [`tokio::task::block_in_place`] internally and therefore
+    /// **must be called from a multi-thread Tokio runtime** (the default for
+    /// `#[tokio::main]`). It will panic if called from a `current_thread` runtime.
     pub async fn yield_pcm(&mut self) -> Result<Option<Vec<f32>>, opus::Error> {
         loop {
             // Buffer management
@@ -49,7 +56,9 @@ impl OpusJitterBuffer {
                     let chunk = self.buffer.remove(&next_play_ts).unwrap();
                     let max_samples = 5760 * self.channels as usize;
                     let mut pcm = vec![0f32; max_samples];
-                    let decoded_len = self.decoder.decode_float(&chunk, &mut pcm, false)?;
+                    let decoded_len = tokio::task::block_in_place(|| {
+                        self.decoder.decode_float(&chunk, &mut pcm, false)
+                    })?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));
@@ -63,7 +72,9 @@ impl OpusJitterBuffer {
                 } else if max_ts.saturating_sub(next_play_ts) >= self.playout_delay_ms {
                     let max_samples = 5760 * self.channels as usize;
                     let mut pcm = vec![0f32; max_samples];
-                    let decoded_len = self.decoder.decode_float(&[], &mut pcm, true)?;
+                    let decoded_len = tokio::task::block_in_place(|| {
+                        self.decoder.decode_float(&[], &mut pcm, true)
+                    })?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));

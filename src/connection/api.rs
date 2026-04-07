@@ -48,6 +48,10 @@ pub enum ProtofishConnectionError {
     /// The client exceeded the maximum number of connection retries.
     #[error("Max retries exceeded")]
     MaxRetriesExceeded,
+
+    /// The handshake did not complete within the configured timeout.
+    #[error("Handshake timed out")]
+    HandshakeTimeout,
 }
 
 /// Configuration for a Protofish2 server.
@@ -130,17 +134,31 @@ impl ProtofishServer {
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(config.cert_chain.clone(), config.private_key.clone_key())
-            .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to load server TLS certificates: {}", e)))?;
+            .map_err(|e| {
+                ProtofishConnectionError::EndpointError(format!(
+                    "Failed to load server TLS certificates: {}",
+                    e
+                ))
+            })?;
 
         server_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
 
         let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-                .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to build QUIC server crypto config: {}", e)))?,
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(|e| {
+                ProtofishConnectionError::EndpointError(format!(
+                    "Failed to build QUIC server crypto config: {}",
+                    e
+                ))
+            })?,
         ));
 
-        let endpoint = quinn::Endpoint::server(server_config, config.bind_address)
-            .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to bind server endpoint to {}: {}", config.bind_address, e)))?;
+        let endpoint =
+            quinn::Endpoint::server(server_config, config.bind_address).map_err(|e| {
+                ProtofishConnectionError::EndpointError(format!(
+                    "Failed to bind server endpoint to {}: {}",
+                    config.bind_address, e
+                ))
+            })?;
 
         Ok(Self {
             endpoint,
@@ -224,64 +242,86 @@ impl IncomingProtofishConnection {
     /// Returns `ProtofishConnectionError::HandshakeFailed` if the client sends invalid
     /// handshake messages or uses an unsupported protocol version.
     pub async fn accept(self) -> Result<ProtofishConnection, ProtofishConnectionError> {
-        let conn = self.incoming.await?;
+        let server_config = self.server_config;
+        let handshake_timeout = server_config.protofish_config.handshake_timeout;
+        let keepalive_timeout = server_config.protofish_config.keepalive_timeout;
+        let incoming = self.incoming;
 
-        let (send, recv) = conn.accept_bi().await?;
+        let (conn, compression_type, keepalive_interval, framed_send, framed_recv) =
+            tokio::time::timeout(handshake_timeout, async {
+                let conn = incoming.await?;
 
-        let mut framed_recv = tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
-        let mut framed_send = tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
+                let (send, recv) = conn.accept_bi().await?;
 
-        let hello_msg = framed_recv.next().await.ok_or_else(|| {
-            ProtofishConnectionError::HandshakeFailed("Connection closed before ClientHello".into())
-        })??;
+                let mut framed_recv =
+                    tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
+                let mut framed_send =
+                    tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
 
-        let client_hello = match hello_msg {
-            ConnectionMessage::ClientHello(hello) => hello,
-            _ => {
-                return Err(ProtofishConnectionError::HandshakeFailed(
-                    "Expected ClientHello".into(),
-                ));
-            }
-        };
+                let hello_msg = framed_recv.next().await.ok_or_else(|| {
+                    ProtofishConnectionError::HandshakeFailed(
+                        "Connection closed before ClientHello".into(),
+                    )
+                })??;
 
-        if client_hello.version != 1 {
-            return Err(ProtofishConnectionError::HandshakeFailed(format!(
-                "Unsupported version {}",
-                client_hello.version
-            )));
-        }
+                let client_hello = match hello_msg {
+                    ConnectionMessage::ClientHello(hello) => hello,
+                    _ => {
+                        return Err(ProtofishConnectionError::HandshakeFailed(
+                            "Expected ClientHello".into(),
+                        ));
+                    }
+                };
 
-        let compression_type = self
-            .server_config
-            .supported_compression_types
-            .iter()
-            .find(|&&c| client_hello.available_compression_types.contains(&c))
-            .copied()
-            .unwrap_or(CompressionType::None);
+                if client_hello.version != 1 {
+                    return Err(ProtofishConnectionError::HandshakeFailed(format!(
+                        "Unsupported version {}",
+                        client_hello.version
+                    )));
+                }
 
-        let server_hello = ServerHello {
-            version: 1,
-            headers: HashMap::new(),
-            compression_type,
-            keepalive_interval_ms: self.server_config.keepalive_interval.as_millis() as u32,
-        };
+                let compression_type = server_config
+                    .supported_compression_types
+                    .iter()
+                    .find(|&&c| client_hello.available_compression_types.contains(&c))
+                    .copied()
+                    .unwrap_or(CompressionType::None);
 
-        let keepalive_interval = Duration::from_millis(server_hello.keepalive_interval_ms as u64);
+                let server_hello = ServerHello {
+                    version: 1,
+                    headers: HashMap::new(),
+                    compression_type,
+                    keepalive_interval_ms: server_config.keepalive_interval.as_millis() as u32,
+                };
 
-        framed_send
-            .send(ConnectionMessage::ServerHello(server_hello))
-            .await?;
+                let keepalive_interval =
+                    Duration::from_millis(server_hello.keepalive_interval_ms as u64);
+
+                framed_send
+                    .send(ConnectionMessage::ServerHello(server_hello))
+                    .await?;
+
+                Ok::<_, ProtofishConnectionError>((
+                    conn,
+                    compression_type,
+                    keepalive_interval,
+                    framed_send,
+                    framed_recv,
+                ))
+            })
+            .await
+            .map_err(|_| ProtofishConnectionError::HandshakeTimeout)??;
 
         let datagram_router = crate::datagram::router::DatagramPacketRouter::new(
-            self.server_config
+            server_config
                 .protofish_config
                 .mani_config
                 .max_chunk_buffer_size,
-            self.server_config
+            server_config
                 .protofish_config
                 .mani_config
                 .pending_chunk_timeout,
-            self.server_config
+            server_config
                 .protofish_config
                 .mani_config
                 .pending_chunk_cleanup_interval,
@@ -294,14 +334,21 @@ impl IncomingProtofishConnection {
 
         let quic_clone_ka = conn.clone();
         tokio::spawn(async move {
-            keepalive_task(framed_send, framed_recv, keepalive_interval, quic_clone_ka).await;
+            keepalive_task(
+                framed_send,
+                framed_recv,
+                keepalive_interval,
+                keepalive_timeout.max(keepalive_interval),
+                quic_clone_ka,
+            )
+            .await;
         });
 
         Ok(ProtofishConnection {
             quic_conn: conn,
             state: Arc::new(RwLock::new(ConnectionState { compression_type })),
             datagram_router,
-            protofish_config: self.server_config.protofish_config.clone(),
+            protofish_config: server_config.protofish_config.clone(),
         })
     }
 }
@@ -376,9 +423,12 @@ impl ProtofishClient {
     pub fn bind(config: ClientConfig) -> Result<Self, ProtofishConnectionError> {
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &config.root_certificates {
-            root_store
-                .add(cert.clone())
-                .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to load root certificate: {}", e)))?;
+            root_store.add(cert.clone()).map_err(|e| {
+                ProtofishConnectionError::EndpointError(format!(
+                    "Failed to load root certificate: {}",
+                    e
+                ))
+            })?;
         }
 
         let mut client_crypto = rustls::ClientConfig::builder()
@@ -388,12 +438,20 @@ impl ProtofishClient {
         client_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
 
         let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to build QUIC client crypto config: {}", e)))?,
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).map_err(|e| {
+                ProtofishConnectionError::EndpointError(format!(
+                    "Failed to build QUIC client crypto config: {}",
+                    e
+                ))
+            })?,
         ));
 
-        let mut endpoint = quinn::Endpoint::client(config.bind_address)
-            .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to bind client endpoint to {}: {}", config.bind_address, e)))?;
+        let mut endpoint = quinn::Endpoint::client(config.bind_address).map_err(|e| {
+            ProtofishConnectionError::EndpointError(format!(
+                "Failed to bind client endpoint to {}: {}",
+                config.bind_address, e
+            ))
+        })?;
 
         endpoint.set_default_client_config(client_config);
 
@@ -431,42 +489,71 @@ impl ProtofishClient {
         server_name: &str,
         headers: HashMap<String, Bytes>,
     ) -> Result<ProtofishConnection, ProtofishConnectionError> {
-        let conn = self
-            .endpoint
-            .connect(server_addr, server_name)
-            .map_err(|e| ProtofishConnectionError::EndpointError(format!("Failed to connect to server '{}' at {}: {}", server_name, server_addr, e)))?
-            .await?;
+        let handshake_timeout = self.config.protofish_config.handshake_timeout;
+        let keepalive_timeout = self.config.protofish_config.keepalive_timeout;
 
-        let (send, recv) = conn.open_bi().await?;
+        let (conn, compression_type, keepalive_interval, framed_send, framed_recv) =
+            tokio::time::timeout(handshake_timeout, async {
+                let conn = self
+                    .endpoint
+                    .connect(server_addr, server_name)
+                    .map_err(|e| {
+                        ProtofishConnectionError::EndpointError(format!(
+                            "Failed to connect to server '{}' at {}: {}",
+                            server_name, server_addr, e
+                        ))
+                    })?
+                    .await?;
 
-        let mut framed_recv = tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
-        let mut framed_send = tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
+                let (send, recv) = conn.open_bi().await?;
 
-        let client_hello = ClientHello {
-            version: 1,
-            host: server_name.to_string(),
-            headers,
-            available_compression_types: self.config.supported_compression_types.clone(),
-            keepalive_min_ms: self.config.keepalive_range.start.as_millis() as u32,
-            keepalive_max_ms: self.config.keepalive_range.end.as_millis() as u32,
-        };
+                let mut framed_recv =
+                    tokio_util::codec::FramedRead::new(recv, ControlStreamCodec::new());
+                let mut framed_send =
+                    tokio_util::codec::FramedWrite::new(send, ControlStreamCodec::new());
 
-        framed_send
-            .send(ConnectionMessage::ClientHello(client_hello))
-            .await?;
+                let client_hello = ClientHello {
+                    version: 1,
+                    host: server_name.to_string(),
+                    headers,
+                    available_compression_types: self.config.supported_compression_types.clone(),
+                    keepalive_min_ms: self.config.keepalive_range.start.as_millis() as u32,
+                    keepalive_max_ms: self.config.keepalive_range.end.as_millis() as u32,
+                };
 
-        let hello_resp = framed_recv.next().await.ok_or_else(|| {
-            ProtofishConnectionError::HandshakeFailed("Connection closed before ServerHello".into())
-        })??;
+                framed_send
+                    .send(ConnectionMessage::ClientHello(client_hello))
+                    .await?;
 
-        let server_hello = match hello_resp {
-            ConnectionMessage::ServerHello(hello) => hello,
-            _ => {
-                return Err(ProtofishConnectionError::HandshakeFailed(
-                    "Expected ServerHello".into(),
-                ));
-            }
-        };
+                let hello_resp = framed_recv.next().await.ok_or_else(|| {
+                    ProtofishConnectionError::HandshakeFailed(
+                        "Connection closed before ServerHello".into(),
+                    )
+                })??;
+
+                let server_hello = match hello_resp {
+                    ConnectionMessage::ServerHello(hello) => hello,
+                    _ => {
+                        return Err(ProtofishConnectionError::HandshakeFailed(
+                            "Expected ServerHello".into(),
+                        ));
+                    }
+                };
+
+                let compression_type = server_hello.compression_type;
+                let keepalive_interval =
+                    Duration::from_millis(server_hello.keepalive_interval_ms as u64);
+
+                Ok::<_, ProtofishConnectionError>((
+                    conn,
+                    compression_type,
+                    keepalive_interval,
+                    framed_send,
+                    framed_recv,
+                ))
+            })
+            .await
+            .map_err(|_| ProtofishConnectionError::HandshakeTimeout)??;
 
         let datagram_router = crate::datagram::router::DatagramPacketRouter::new(
             self.config
@@ -488,17 +575,21 @@ impl ProtofishClient {
             router_clone.run(quic_clone).await;
         });
 
-        let keepalive_interval = Duration::from_millis(server_hello.keepalive_interval_ms as u64);
         let quic_clone_ka = conn.clone();
         tokio::spawn(async move {
-            keepalive_task(framed_send, framed_recv, keepalive_interval, quic_clone_ka).await;
+            keepalive_task(
+                framed_send,
+                framed_recv,
+                keepalive_interval,
+                keepalive_timeout.max(keepalive_interval),
+                quic_clone_ka,
+            )
+            .await;
         });
 
         Ok(ProtofishConnection {
             quic_conn: conn,
-            state: Arc::new(RwLock::new(ConnectionState {
-                compression_type: server_hello.compression_type,
-            })),
+            state: Arc::new(RwLock::new(ConnectionState { compression_type })),
             datagram_router,
             protofish_config: self.config.protofish_config.clone(),
         })
@@ -653,6 +744,7 @@ async fn keepalive_task(
     mut send: tokio_util::codec::FramedWrite<quinn::SendStream, ControlStreamCodec>,
     mut recv: tokio_util::codec::FramedRead<quinn::RecvStream, ControlStreamCodec>,
     keepalive_interval: Duration,
+    keepalive_timeout: Duration,
     conn: quinn::Connection,
 ) {
     if keepalive_interval.is_zero() {
@@ -661,29 +753,34 @@ async fn keepalive_task(
 
     let mut timer = tokio::time::interval(keepalive_interval);
     timer.tick().await; // Initial tick
-    let timeout_duration = keepalive_interval * 3;
     let mut last_activity = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             _ = timer.tick() => {
-                if last_activity.elapsed() > timeout_duration {
+                tracing::trace!("Keepalive tick");
+
+                if last_activity.elapsed() > keepalive_timeout {
                     conn.close(quinn::VarInt::from_u32(1), b"keepalive timeout");
                     break;
                 }
                 if send.send(ConnectionMessage::Keepalive).await.is_err() {
                     break;
                 }
+                last_activity = tokio::time::Instant::now();
             }
             msg = recv.next() => {
                 match msg {
                     Some(Ok(ConnectionMessage::Keepalive)) => {
+                        tracing::trace!("Received keepalive");
+
                         last_activity = tokio::time::Instant::now();
                         if send.send(ConnectionMessage::KeepaliveAck).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(ConnectionMessage::KeepaliveAck)) => {
+                        tracing::trace!("Received keepalive ack");
                         last_activity = tokio::time::Instant::now();
                     }
                     Some(Ok(ConnectionMessage::Close)) => {
