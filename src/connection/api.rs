@@ -143,7 +143,7 @@ impl ProtofishServer {
 
         server_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
 
-        let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(|e| {
                 ProtofishConnectionError::EndpointError(format!(
                     "Failed to build QUIC server crypto config: {}",
@@ -151,6 +151,15 @@ impl ProtofishServer {
                 ))
             })?,
         ));
+
+        let quic_idle_timeout = config.protofish_config.keepalive_timeout * 3;
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(quic_idle_timeout).unwrap_or(quinn::IdleTimeout::from(
+                quinn::VarInt::from_u32(u32::MAX),
+            )),
+        ));
+        server_config.transport_config(std::sync::Arc::new(transport));
 
         let endpoint =
             quinn::Endpoint::server(server_config, config.bind_address).map_err(|e| {
@@ -437,7 +446,7 @@ impl ProtofishClient {
 
         client_crypto.alpn_protocols = vec![b"protofish2".to_vec()];
 
-        let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+        let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).map_err(|e| {
                 ProtofishConnectionError::EndpointError(format!(
                     "Failed to build QUIC client crypto config: {}",
@@ -445,6 +454,15 @@ impl ProtofishClient {
                 ))
             })?,
         ));
+
+        let quic_idle_timeout = config.protofish_config.keepalive_timeout * 3;
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(quic_idle_timeout).unwrap_or(quinn::IdleTimeout::from(
+                quinn::VarInt::from_u32(u32::MAX),
+            )),
+        ));
+        client_config.transport_config(std::sync::Arc::new(transport));
 
         let mut endpoint = quinn::Endpoint::client(config.bind_address).map_err(|e| {
             ProtofishConnectionError::EndpointError(format!(
@@ -771,7 +789,6 @@ async fn keepalive_task(
                 if send.send(ConnectionMessage::Keepalive).await.is_err() {
                     break;
                 }
-                last_activity = tokio::time::Instant::now();
             }
             msg = recv.next() => {
                 match msg {

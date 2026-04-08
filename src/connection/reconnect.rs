@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::watch;
 
 use crate::config::ReconnectConfig;
 use crate::connection::api::{ProtofishClient, ProtofishConnection, ProtofishConnectionError};
@@ -38,6 +39,7 @@ pub struct ReconnectingConnection {
     headers: HashMap<String, Bytes>,
     config: ReconnectConfig,
     active_connection: Option<ProtofishConnection>,
+    reconnect_tx: watch::Sender<u64>,
 }
 
 impl ReconnectingConnection {
@@ -51,6 +53,7 @@ impl ReconnectingConnection {
         headers: HashMap<String, Bytes>,
         config: ReconnectConfig,
     ) -> Result<Self, ProtofishConnectionError> {
+        let (reconnect_tx, _) = watch::channel(0u64);
         let mut rc = Self {
             client,
             server_addr,
@@ -58,6 +61,7 @@ impl ReconnectingConnection {
             headers,
             config,
             active_connection: None,
+            reconnect_tx,
         };
 
         rc.ensure_connected().await?;
@@ -85,6 +89,8 @@ impl ReconnectingConnection {
             {
                 Ok(conn) => {
                     self.active_connection = Some(conn);
+                    let next_gen = *self.reconnect_tx.borrow() + 1;
+                    let _ = self.reconnect_tx.send(next_gen);
                     return Ok(());
                 }
                 Err(e) => {
@@ -149,5 +155,27 @@ impl ReconnectingConnection {
     /// Access the underlying `ProtofishConnection` if connected.
     pub fn get_connection(&self) -> Option<&ProtofishConnection> {
         self.active_connection.as_ref()
+    }
+
+    /// Returns a receiver that fires whenever a new connection is established.
+    ///
+    /// The value is a monotonically increasing generation counter starting at 1.
+    /// Use `changed().await` to wait for the next reconnect event, then call
+    /// `borrow_and_update()` to read the new generation and mark it as seen.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let mut rx = conn.subscribe_reconnect();
+    /// tokio::spawn(async move {
+    ///     loop {
+    ///         rx.changed().await.unwrap();
+    ///         let gen = *rx.borrow_and_update();
+    ///         println!("Reconnected (generation {gen}), re-doing handshake...");
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe_reconnect(&self) -> watch::Receiver<u64> {
+        self.reconnect_tx.subscribe()
     }
 }
