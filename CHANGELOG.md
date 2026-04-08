@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.2]
+### Fixed
+- Fixed PLC hang again...
+
 ## [0.6.1]
 ### Fixed
 - Fixed PLC hang.
