@@ -341,7 +341,7 @@ impl IncomingProtofishConnection {
         });
 
         let quic_clone_ka = conn.clone();
-        tokio::spawn(async move {
+        let keepalive_abort = tokio::spawn(async move {
             keepalive_task(
                 framed_send,
                 framed_recv,
@@ -350,13 +350,15 @@ impl IncomingProtofishConnection {
                 quic_clone_ka,
             )
             .await;
-        });
+        })
+        .abort_handle();
 
         Ok(ProtofishConnection {
             quic_conn: conn,
             state: Arc::new(RwLock::new(ConnectionState { compression_type })),
             datagram_router,
             protofish_config: server_config.protofish_config.clone(),
+            keepalive_abort: if keepalive_interval.is_zero() { None } else { Some(keepalive_abort) },
         })
     }
 }
@@ -593,7 +595,7 @@ impl ProtofishClient {
         });
 
         let quic_clone_ka = conn.clone();
-        tokio::spawn(async move {
+        let keepalive_abort = tokio::spawn(async move {
             keepalive_task(
                 framed_send,
                 framed_recv,
@@ -602,13 +604,15 @@ impl ProtofishClient {
                 quic_clone_ka,
             )
             .await;
-        });
+        })
+        .abort_handle();
 
         Ok(ProtofishConnection {
             quic_conn: conn,
             state: Arc::new(RwLock::new(ConnectionState { compression_type })),
             datagram_router,
             protofish_config: self.config.protofish_config.clone(),
+            keepalive_abort: if keepalive_interval.is_zero() { None } else { Some(keepalive_abort) },
         })
     }
 }
@@ -641,6 +645,7 @@ pub struct ProtofishConnection {
     pub state: Arc<RwLock<ConnectionState>>,
     pub datagram_router: crate::datagram::router::DatagramPacketRouter,
     pub protofish_config: crate::config::ProtofishConfig,
+    pub keepalive_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl ProtofishConnection {
@@ -758,6 +763,14 @@ impl ProtofishConnection {
     /// Closes the connection gracefully.
     pub fn close(&self) {
         self.quic_conn.close(quinn::VarInt::from_u32(0), b"");
+    }
+}
+
+impl Drop for ProtofishConnection {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.keepalive_abort {
+            handle.abort();
+        }
     }
 }
 

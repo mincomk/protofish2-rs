@@ -21,14 +21,14 @@ impl BackpressureBank {
     }
 
     pub fn increase_credits(&self, amount: usize) {
-        tracing::debug!("Increasing credits by {}", amount);
+        tracing::trace!("Increasing credits by {}", amount);
 
         self.credits.fetch_add(amount, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
 
     pub fn decrease_credits(&self, amount: usize) {
-        tracing::debug!("Decreasing credits by {}", amount);
+        tracing::trace!("Decreasing credits by {}", amount);
         self.credits.fetch_sub(amount, Ordering::SeqCst);
     }
 
