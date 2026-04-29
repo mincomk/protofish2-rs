@@ -689,13 +689,27 @@ impl ManiStreamTask {
                     content: retrans.payload,
                 };
 
-                if let Err(err) = retrans_packet_sender.send(packet).await {
-                    tracing::debug!(
-                        "Failed to send retransmitted chunk to pipeline on stream {}: {}",
-                        self.id,
-                        err
-                    );
-                    return false;
+                // try_send so a full datagram channel does not block the
+                // ManiStreamTask. Blocking here would also prevent UpdateCredits
+                // (and further reads from the wire) from being processed,
+                // deadlocking the sender.
+                use tokio::sync::mpsc::error::TrySendError;
+                match retrans_packet_sender.try_send(packet) {
+                    Ok(_) => {}
+                    Err(TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            stream_id = self.id.0,
+                            sequence_number = retrans.sequence_number.0,
+                            "Datagram channel full while delivering retrans; dropping (will be re-NACKed)"
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        tracing::debug!(
+                            "Failed to send retransmitted chunk to pipeline on stream {}: closed",
+                            self.id
+                        );
+                        return false;
+                    }
                 }
                 true
             }

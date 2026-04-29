@@ -75,8 +75,7 @@ impl CompressedPacketReceiver {
                 Ok(DecodedContent::Single(compressed)) => {
                     let decompressed = self.compression.decompress(&compressed);
                     let stop = self
-                        .route(packet.stream_id, packet.sequence_number, packet.timestamp, decompressed)
-                        .await;
+                        .route(packet.stream_id, packet.sequence_number, packet.timestamp, decompressed);
                     if stop {
                         break;
                     }
@@ -143,14 +142,12 @@ impl CompressedPacketReceiver {
                             if ok {
                                 let decompressed =
                                     self.compression.decompress(&assembled.freeze());
-                                let stop = self
-                                    .route(
-                                        packet.stream_id,
-                                        packet.sequence_number,
-                                        buf.timestamp,
-                                        decompressed,
-                                    )
-                                    .await;
+                                let stop = self.route(
+                                    packet.stream_id,
+                                    packet.sequence_number,
+                                    buf.timestamp,
+                                    decompressed,
+                                );
                                 if stop {
                                     break;
                                 }
@@ -164,33 +161,52 @@ impl CompressedPacketReceiver {
 
     /// Routes a decompressed packet to all registered senders.
     /// Returns `true` if the receiver loop should stop (all senders dropped).
-    async fn route(
+    ///
+    /// Uses `try_send` rather than awaiting on the downstream channel: blocking
+    /// here would stall the upstream loop, which is also responsible for
+    /// issuing `TransferCreditsUpdate` messages back to the sender. If those
+    /// credits stop flowing, the sender deadlocks once it exhausts its initial
+    /// backpressure budget. Packets dropped on a full downstream channel will
+    /// be detected as gaps by the assembler and recovered via NACK/retrans.
+    fn route(
         &self,
         stream_id: crate::ManiStreamId,
         sequence_number: crate::SequenceNumber,
         timestamp: Timestamp,
         decompressed: Vec<u8>,
     ) -> bool {
-        let mut any_success = false;
+        use tokio::sync::mpsc::error::TrySendError;
+
+        let mut any_alive = false;
 
         for sender in &self.senders {
-            if sender
-                .send(Packet {
-                    stream_id,
-                    sequence_number,
-                    timestamp,
-                    content: Bytes::from(decompressed.clone()),
-                })
-                .await
-                .is_ok()
-            {
-                any_success = true;
-            } else {
-                tracing::debug!("Failed to send decompressed packet, receiver likely dropped");
+            let packet = Packet {
+                stream_id,
+                sequence_number,
+                timestamp,
+                content: Bytes::from(decompressed.clone()),
+            };
+            match sender.try_send(packet) {
+                Ok(_) => {
+                    any_alive = true;
+                }
+                Err(TrySendError::Full(_)) => {
+                    any_alive = true;
+                    tracing::warn!(
+                        stream_id = stream_id.0,
+                        sequence_number = sequence_number.0,
+                        "Downstream chunk channel full; dropping packet, will rely on NACK/retrans"
+                    );
+                }
+                Err(TrySendError::Closed(_)) => {
+                    tracing::debug!(
+                        "Failed to send decompressed packet, receiver likely dropped"
+                    );
+                }
             }
         }
 
-        if !any_success && !self.senders.is_empty() {
+        if !any_alive && !self.senders.is_empty() {
             tracing::debug!(
                 "All receivers dropped for stream {}, stopping CompressedPacketReceiver",
                 stream_id.0
