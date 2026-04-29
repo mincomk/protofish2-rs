@@ -4,6 +4,20 @@ use crate::mani::transfer::recv::TransferUnreliableRecvStream;
 use bytes::Bytes;
 #[cfg(feature = "jitter")]
 use std::collections::BTreeMap;
+#[cfg(feature = "jitter")]
+use std::time::Duration;
+
+#[cfg(feature = "jitter")]
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(feature = "jitter")]
+#[derive(Debug, thiserror::Error)]
+pub enum JitterError {
+    #[error(transparent)]
+    Opus(#[from] opus::Error),
+    #[error("no frame received for {}s", STALL_TIMEOUT.as_secs())]
+    Stalled,
+}
 
 #[cfg(feature = "jitter")]
 pub struct OpusJitterBuffer {
@@ -41,12 +55,9 @@ impl OpusJitterBuffer {
 
     /// Yields the next decoded PCM frame.
     ///
-    /// # Runtime requirement
-    ///
-    /// This method uses [`tokio::task::block_in_place`] internally and therefore
-    /// **must be called from a multi-thread Tokio runtime** (the default for
-    /// `#[tokio::main]`). It will panic if called from a `current_thread` runtime.
-    pub async fn yield_pcm(&mut self) -> Result<Option<Vec<f32>>, opus::Error> {
+    /// Works on both `current_thread` and multi-thread Tokio runtimes.
+    /// Returns `Err(JitterError::Stalled)` if no frame arrives for 3 seconds.
+    pub async fn yield_pcm(&mut self) -> Result<Option<Vec<f32>>, JitterError> {
         loop {
             // Buffer management
             if let Some(next_play_ts) = self.next_play_ts {
@@ -56,9 +67,7 @@ impl OpusJitterBuffer {
                     let chunk = self.buffer.remove(&next_play_ts).unwrap();
                     let max_samples = 5760 * self.channels as usize;
                     let mut pcm = vec![0f32; max_samples];
-                    let decoded_len = tokio::task::block_in_place(|| {
-                        self.decoder.decode_float(&chunk, &mut pcm, false)
-                    })?;
+                    let decoded_len = self.decoder.decode_float(&chunk, &mut pcm, false)?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));
@@ -72,25 +81,26 @@ impl OpusJitterBuffer {
                 } else if max_ts.saturating_sub(next_play_ts) >= self.playout_delay_ms {
                     let max_samples = 5760 * self.channels as usize;
                     let mut pcm = vec![0f32; max_samples];
-                    let decoded_len = tokio::task::block_in_place(|| {
-                        self.decoder.decode_float(&[], &mut pcm, true)
-                    })?;
+                    let decoded_len = self.decoder.decode_float(&[], &mut pcm, true)?;
                     pcm.truncate(decoded_len * self.channels as usize);
                     self.next_play_ts = Some(next_play_ts + self.frame_size_ms);
                     return Ok(Some(pcm));
                 }
             }
 
-            // Receive next chunk
-            match self.receiver.recv().await {
-                Some(chunk) => {
+            // Receive next chunk with stall watchdog
+            let recv_result =
+                tokio::time::timeout(STALL_TIMEOUT, self.receiver.recv()).await;
+            match recv_result {
+                Err(_) => return Err(JitterError::Stalled),
+                Ok(Some(chunk)) => {
                     let ts = chunk.timestamp.0;
                     if self.next_play_ts.is_none() {
                         self.next_play_ts = Some(ts);
                     }
                     self.buffer.insert(ts, chunk.content);
                 }
-                None => {
+                Ok(None) => {
                     self.is_eof = true;
                     // If no frames were ever received, there is nothing to play.
                     if self.next_play_ts.is_none() {

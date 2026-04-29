@@ -205,6 +205,16 @@ impl TransferSendStream {
         self.sequence_counter
     }
 
+    fn final_sequence_number(&self) -> SequenceNumber {
+        // If no data was sent, use initial_sequence_number - 1 (wrapping) so it's
+        // distinguishable from a 1-chunk transfer whose final_seq equals initial_seq.
+        if self.sequence_counter != self.initial_sequence_number {
+            SequenceNumber(self.sequence_counter.0.wrapping_sub(1))
+        } else {
+            SequenceNumber(self.initial_sequence_number.0.wrapping_sub(1))
+        }
+    }
+
     /// Signals the end of the transfer and waits for acknowledgment.
     ///
     /// After calling this, no more data can be sent. The peer will be notified
@@ -223,17 +233,9 @@ impl TransferSendStream {
     pub async fn end(&mut self) -> Result<(), TransferSendError> {
         tracing::debug!("Ending transfer with stream ID {}", self.id.0);
 
-        // If no data was sent, use initial_sequence_number as the final sequence number.
-        // This signals to the receiver that the transfer is empty and the ack can be sent immediately.
-        let final_sequence_number = if self.sequence_counter != self.initial_sequence_number {
-            SequenceNumber(self.sequence_counter.0.wrapping_sub(1))
-        } else {
-            // Signal empty transfer with initial_seq - 1 (wrapping) so it's distinguishable
-            // from a 1-chunk transfer whose final_seq equals initial_seq.
-            SequenceNumber(self.initial_sequence_number.0.wrapping_sub(1))
-        };
+        let final_sequence_number = self.final_sequence_number();
 
-        if let Some(command_sender) = &self.command_sender {
+        if let Some(command_sender) = self.command_sender.take() {
             let (response_tx, response_rx) = oneshot::channel();
 
             command_sender
@@ -258,5 +260,31 @@ impl TransferSendStream {
                 "Command sender not available".to_string(),
             ))
         }
+    }
+}
+
+impl Drop for TransferSendStream {
+    fn drop(&mut self) {
+        let Some(command_sender) = self.command_sender.take() else {
+            return; // end() was called explicitly
+        };
+        let final_sequence_number = self.final_sequence_number();
+        let id = self.id.0;
+        tokio::spawn(async move {
+            let (response_tx, _response_rx) = oneshot::channel();
+            if let Err(err) = command_sender
+                .send(TransferSendCommand::EndTransfer {
+                    final_sequence_number,
+                    response: response_tx,
+                })
+                .await
+            {
+                tracing::debug!(
+                    stream_id = id,
+                    "Failed to send best-effort EndTransfer on drop: {}",
+                    err
+                );
+            }
+        });
     }
 }
