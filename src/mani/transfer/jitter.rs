@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[cfg(feature = "jitter")]
-const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(feature = "jitter")]
 #[derive(Debug, thiserror::Error)]
@@ -89,8 +89,7 @@ impl OpusJitterBuffer {
             }
 
             // Receive next chunk with stall watchdog
-            let recv_result =
-                tokio::time::timeout(STALL_TIMEOUT, self.receiver.recv()).await;
+            let recv_result = tokio::time::timeout(STALL_TIMEOUT, self.receiver.recv()).await;
             match recv_result {
                 Err(_) => return Err(JitterError::Stalled),
                 Ok(Some(chunk)) => {
