@@ -126,6 +126,8 @@ pub(crate) struct ManiStreamTask {
     /// close the writer while this is non-zero even if the ManiStream handle has
     /// already been dropped.
     pending_ack_count: usize,
+
+    credits_request_interval: Option<tokio::time::Interval>,
 }
 
 impl ManiStreamTask {
@@ -205,11 +207,24 @@ impl ManiStreamTask {
                             break;
                         }
                     }
+                    _ = Self::tick_or_pending(&mut self.credits_request_interval) => {
+                        if let Err(err) = self.writer.write_frame(&ManiMessage::TransferCreditsRequest).await {
+                            tracing::debug!("Failed to send TransferCreditsRequest on stream {}: {}", self.id, err);
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         self.backpressure_bank.signal_shutdown();
+    }
+
+    async fn tick_or_pending(interval: &mut Option<tokio::time::Interval>) {
+        match interval {
+            Some(i) => { i.tick().await; }
+            None => std::future::pending().await,
+        }
     }
 
     async fn handle_sender_command(&mut self, command: RecvSenderCommand) -> bool {
@@ -485,6 +500,20 @@ impl ManiStreamTask {
                     self.backpressure_bank
                         .increase_credits(update.additional_credits);
 
+                    true
+                }
+                ManiMessage::TransferCreditsRequest => {
+                    let msg = ManiMessage::TransferCreditsUpdate(TransferCreditsUpdate {
+                        additional_credits: self.credits_bulk_update_count,
+                    });
+                    if let Err(err) = self.writer.write_frame(&msg).await {
+                        tracing::debug!(
+                            "Failed to send TransferCreditsUpdate in response to request on stream {}: {}",
+                            self.id,
+                            err
+                        );
+                        return false;
+                    }
                     true
                 }
                 _ => {
@@ -905,6 +934,7 @@ impl ManiStream {
         initial_backpressure_credits: usize,
         credits_bulk_update_count: usize,
         max_datagram_size: Option<usize>,
+        sender_transfer_credits_request_interval: Option<std::time::Duration>,
     ) -> (Self, ManiStreamTask) {
         let (message_sender, message_receiver) = tokio::sync::mpsc::channel(100);
         let (command_sender, command_receiver) = tokio::sync::mpsc::channel(100);
@@ -917,6 +947,19 @@ impl ManiStream {
             message_receiver,
             command_sender,
         };
+
+        if credits_bulk_update_count > initial_backpressure_credits {
+            tracing::error!(
+                credits_bulk_update_count,
+                initial_backpressure_credits,
+                "backpressure_credit_batch_size exceeds initial_backpressure_credits: \
+                 sender will stall after exhausting initial credits before the first \
+                 TransferCreditsUpdate is issued"
+            );
+        }
+
+        let credits_request_interval = sender_transfer_credits_request_interval
+            .map(tokio::time::interval);
 
         let task = ManiStreamTask {
             id,
@@ -940,6 +983,7 @@ impl ManiStream {
             sender_command_receiver: sc_receiver,
             backpressure_bank: BackpressureBank::new(initial_backpressure_credits),
             pending_ack_count: 0,
+            credits_request_interval,
         };
 
         (stream, task)

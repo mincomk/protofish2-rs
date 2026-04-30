@@ -692,6 +692,9 @@ impl ProtofishConnection {
                 .mani_config
                 .backpressure_credit_batch_size,
             self.protofish_config.mani_config.max_datagram_size,
+            self.protofish_config
+                .mani_config
+                .sender_transfer_credits_request_interval,
         );
 
         tokio::spawn(async move {
@@ -751,6 +754,9 @@ impl ProtofishConnection {
                 .mani_config
                 .backpressure_credit_batch_size,
             self.protofish_config.mani_config.max_datagram_size,
+            self.protofish_config
+                .mani_config
+                .sender_transfer_credits_request_interval,
         );
 
         tokio::spawn(async move {

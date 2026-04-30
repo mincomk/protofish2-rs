@@ -93,6 +93,7 @@ pub enum ManiMessage {
     TransferError(TransferError),
     EndOfStream,
     TransferCreditsUpdate(TransferCreditsUpdate),
+    TransferCreditsRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +109,7 @@ pub enum ManiMessageType {
     TransferError = 0x07,
     EndOfStream = 0x08,
     TransferCreditsUpdate = 0x09,
+    TransferCreditsRequest = 0x0A,
 }
 
 impl ManiMessageType {
@@ -123,6 +125,7 @@ impl ManiMessageType {
             0x07 => Some(ManiMessageType::TransferError),
             0x08 => Some(ManiMessageType::EndOfStream),
             0x09 => Some(ManiMessageType::TransferCreditsUpdate),
+            0x0A => Some(ManiMessageType::TransferCreditsRequest),
             _ => None,
         }
     }
@@ -142,6 +145,7 @@ impl ManiMessage {
             ManiMessage::TransferError(_) => ManiMessageType::TransferError,
             ManiMessage::EndOfStream => ManiMessageType::EndOfStream,
             ManiMessage::TransferCreditsUpdate(_) => ManiMessageType::TransferCreditsUpdate,
+            ManiMessage::TransferCreditsRequest => ManiMessageType::TransferCreditsRequest,
         }
     }
 }

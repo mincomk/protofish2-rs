@@ -39,6 +39,7 @@ pub fn parse_mani_message(bytes: Bytes) -> Result<ManiMessage, ManiMessageParseE
         ManiMessageType::TransferError => parse_transfer_error_message(&mut cur),
         ManiMessageType::EndOfStream => Ok(ManiMessage::EndOfStream),
         ManiMessageType::TransferCreditsUpdate => parse_transfer_credits_update_message(&mut cur),
+        ManiMessageType::TransferCreditsRequest => Ok(ManiMessage::TransferCreditsRequest),
     }
 }
 
@@ -68,6 +69,9 @@ pub fn serialize_mani_message(message: &ManiMessage) -> Bytes {
         }
         ManiMessage::TransferCreditsUpdate(credits_update) => {
             serialize_transfer_credits_update_message(&mut buf, credits_update)
+        }
+        ManiMessage::TransferCreditsRequest => {
+            buf.put_u8(ManiMessageType::TransferCreditsRequest as u8);
         }
     }
 
