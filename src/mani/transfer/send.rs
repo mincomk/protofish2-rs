@@ -163,6 +163,17 @@ impl TransferSendStream {
             }]
         };
 
+        // Backpressure: acquire one credit per datagram before sending, so the
+        // receiver's channel is never flooded beyond the credit window.
+        for _ in 0..packets.len() {
+            if !self.backpressure_bank.wait_for_credit().await {
+                return Err(TransferSendError::DatagramSendFailed(
+                    "stream closed".to_string(),
+                ));
+            }
+            self.backpressure_bank.decrease_credits(1);
+        }
+
         // Send all datagrams on the wire.
         for packet in &packets {
             self.quic_connection
@@ -184,16 +195,6 @@ impl TransferSendStream {
 
         // One sequence number per logical send.
         self.sequence_counter = SequenceNumber(seq.0.wrapping_add(1));
-
-        // Backpressure: one credit per datagram sent (credits are per-datagram, not per-send).
-        for _ in 0..packets.len() {
-            if !self.backpressure_bank.wait_for_credit().await {
-                return Err(TransferSendError::DatagramSendFailed(
-                    "stream closed".to_string(),
-                ));
-            }
-            self.backpressure_bank.decrease_credits(1);
-        }
 
         Ok(())
     }
