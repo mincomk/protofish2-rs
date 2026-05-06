@@ -20,6 +20,7 @@ pub(crate) enum RecvPipelineCommand {
     },
 }
 
+#[derive(Debug)]
 pub(crate) enum RecvSenderCommand {
     UpdateCredits {
         additional_credits: usize,
@@ -48,9 +49,7 @@ impl Drop for TransferReliableRecvStream {
                 stream_id = self.id.0,
                 "TransferReliableRecvStream dropped without consuming all data; draining channel"
             );
-            tokio::spawn(async move {
-                while receiver.recv().await.is_some() {}
-            });
+            tokio::spawn(async move { while receiver.recv().await.is_some() {} });
         }
     }
 }
@@ -146,9 +145,7 @@ impl Drop for TransferUnreliableRecvStream {
                 stream_id = self.id.0,
                 "TransferUnreliableRecvStream dropped without consuming all data; draining channel"
             );
-            tokio::spawn(async move {
-                while receiver.recv().await.is_some() {}
-            });
+            tokio::spawn(async move { while receiver.recv().await.is_some() {} });
         }
     }
 }

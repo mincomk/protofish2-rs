@@ -170,6 +170,13 @@ impl ManiStreamTask {
                             }
                         }
                     }
+                    Some(cmd) = self.sender_command_receiver.recv() => {
+                        tracing::trace!("Received sender command on stream {}", self.id);
+
+                        if !self.handle_sender_command(cmd).await {
+                            break;
+                        }
+                    }
                     message = self.reader.read_frame() => {
                         if !self.handle_message(message).await {
                             break;
@@ -179,6 +186,8 @@ impl ManiStreamTask {
             } else {
                 tokio::select! {
                     command_opt = self.command_receiver.recv() => {
+                        tracing::trace!("Received command on stream {}", self.id);
+
                         match command_opt {
                             Some(command) => {
                                 if !self.handle_command(command).await {
@@ -197,13 +206,17 @@ impl ManiStreamTask {
                             break;
                         }
                     }
-                    message = self.reader.read_frame() => {
-                        if !self.handle_message(message).await {
+                    Some(cmd) = self.sender_command_receiver.recv() => {
+                        tracing::trace!("Received sender command on stream {}", self.id);
+
+                        if !self.handle_sender_command(cmd).await {
                             break;
                         }
                     }
-                    Some(cmd) = self.sender_command_receiver.recv() => {
-                        if !self.handle_sender_command(cmd).await {
+                    message = self.reader.read_frame() => {
+                        tracing::trace!("Received message on stream {}", self.id);
+
+                        if !self.handle_message(message).await {
                             break;
                         }
                     }
@@ -217,17 +230,27 @@ impl ManiStreamTask {
             }
         }
 
+        tracing::debug!("ManiStreamTask for stream {} exiting", self.id);
+
         self.backpressure_bank.signal_shutdown();
     }
 
     async fn tick_or_pending(interval: &mut Option<tokio::time::Interval>) {
         match interval {
-            Some(i) => { i.tick().await; }
+            Some(i) => {
+                i.tick().await;
+            }
             None => std::future::pending().await,
         }
     }
 
     async fn handle_sender_command(&mut self, command: RecvSenderCommand) -> bool {
+        tracing::trace!(
+            "Sending sender command on stream {}: {:?}",
+            self.id,
+            command
+        );
+
         match command {
             RecvSenderCommand::UpdateCredits { additional_credits } => {
                 let update_credits_message =
@@ -958,8 +981,8 @@ impl ManiStream {
             );
         }
 
-        let credits_request_interval = sender_transfer_credits_request_interval
-            .map(tokio::time::interval);
+        let credits_request_interval =
+            sender_transfer_credits_request_interval.map(tokio::time::interval);
 
         let task = ManiStreamTask {
             id,

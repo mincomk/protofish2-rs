@@ -58,6 +58,7 @@ impl CompressedPacketReceiver {
                 let command = RecvSenderCommand::UpdateCredits {
                     additional_credits: self.updated_credits,
                 };
+                tracing::trace!("Sending credits update1: {}", self.updated_credits);
                 if let Err(err) = self.sender_command_sender.send(command).await {
                     tracing::trace!("Failed to send credits update: {}", err);
                 }
@@ -74,8 +75,12 @@ impl CompressedPacketReceiver {
                 }
                 Ok(DecodedContent::Single(compressed)) => {
                     let decompressed = self.compression.decompress(&compressed);
-                    let stop = self
-                        .route(packet.stream_id, packet.sequence_number, packet.timestamp, decompressed);
+                    let stop = self.route(
+                        packet.stream_id,
+                        packet.sequence_number,
+                        packet.timestamp,
+                        decompressed,
+                    );
                     if stop {
                         break;
                     }
@@ -94,23 +99,20 @@ impl CompressedPacketReceiver {
                     {
                         if let Some(oldest) = self.fragment_buffers.keys().copied().min() {
                             self.fragment_buffers.remove(&oldest);
-                            tracing::debug!(
-                                "Evicted incomplete fragment group seq={}",
-                                oldest
-                            );
+                            tracing::debug!("Evicted incomplete fragment group seq={}", oldest);
                         }
                     }
 
                     // Insert this fragment (scope ends so borrow is released before remove).
                     {
-                        let buf = self
-                            .fragment_buffers
-                            .entry(key)
-                            .or_insert_with(|| FragmentBuffer {
-                                total_frags,
-                                fragments: HashMap::new(),
-                                timestamp: packet.timestamp,
-                            });
+                        let buf =
+                            self.fragment_buffers
+                                .entry(key)
+                                .or_insert_with(|| FragmentBuffer {
+                                    total_frags,
+                                    fragments: HashMap::new(),
+                                    timestamp: packet.timestamp,
+                                });
                         buf.fragments.insert(frag_index, payload);
                     }
 
@@ -140,8 +142,7 @@ impl CompressedPacketReceiver {
                                 }
                             }
                             if ok {
-                                let decompressed =
-                                    self.compression.decompress(&assembled.freeze());
+                                let decompressed = self.compression.decompress(&assembled.freeze());
                                 let stop = self.route(
                                     packet.stream_id,
                                     packet.sequence_number,
@@ -199,9 +200,7 @@ impl CompressedPacketReceiver {
                     );
                 }
                 Err(TrySendError::Closed(_)) => {
-                    tracing::debug!(
-                        "Failed to send decompressed packet, receiver likely dropped"
-                    );
+                    tracing::debug!("Failed to send decompressed packet, receiver likely dropped");
                 }
             }
         }
