@@ -71,7 +71,7 @@ impl Default for ManiConfig {
             pending_chunk_timeout: std::time::Duration::from_secs(5),
             pending_chunk_cleanup_interval: std::time::Duration::from_secs(1),
             initial_backpressure_credits: 100,
-            backpressure_credit_batch_size: 10,
+            backpressure_credit_batch_size: 1,
             sender_transfer_credits_request_interval: Some(std::time::Duration::from_millis(500)),
             max_datagram_size: None,
         }
