@@ -1,63 +1,37 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct BackpressureBank {
-    credits: Arc<AtomicUsize>,
-    notify: Arc<Notify>,
-    closed: Arc<AtomicBool>,
+    sem: Arc<Semaphore>,
 }
 
 impl BackpressureBank {
     pub fn new(initial_credits: usize) -> Self {
         Self {
-            credits: Arc::new(AtomicUsize::new(initial_credits)),
-            notify: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            sem: Arc::new(Semaphore::new(initial_credits)),
         }
     }
 
     pub fn increase_credits(&self, amount: usize) {
         tracing::trace!("Increasing credits by {}", amount);
-
-        self.credits.fetch_add(amount, Ordering::SeqCst);
-        self.notify.notify_one();
-    }
-
-    pub fn decrease_credits(&self, amount: usize) {
-        tracing::trace!("Decreasing credits by {}", amount);
-        self.credits.fetch_sub(amount, Ordering::SeqCst);
+        self.sem.add_permits(amount);
     }
 
     pub fn signal_shutdown(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
+        self.sem.close();
     }
 
-    /// Returns `true` if credit was obtained, `false` if the bank was shut down.
+    /// Acquires one credit. Returns `true` if a credit was obtained,
+    /// `false` if the bank was shut down.
     pub async fn wait_for_credit(&self) -> bool {
-        loop {
-            // Register as a waiter *before* re-checking state, so a notification
-            // issued by a concurrent `increase_credits` / `signal_shutdown`
-            // between the check and the await is captured as a permit on this
-            // future rather than dropped.
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if self.closed.load(Ordering::SeqCst) {
-                return false;
+        match self.sem.acquire().await {
+            Ok(permit) => {
+                permit.forget();
+                true
             }
-            let current_credits = self.credits.load(Ordering::SeqCst);
-            tracing::trace!("Current credits: {}", current_credits);
-            if current_credits > 0 {
-                return true;
-            }
-            notified.await;
+            Err(_) => false,
         }
     }
 }
@@ -72,6 +46,20 @@ mod tests {
     async fn wait_for_credit_returns_immediately_when_credit_available() {
         let bank = BackpressureBank::new(1);
         assert!(bank.wait_for_credit().await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_credit_consumes_one_credit_per_call() {
+        let bank = BackpressureBank::new(1);
+        assert!(bank.wait_for_credit().await);
+
+        // Second call must block: no credits left.
+        let bank2 = bank.clone();
+        let blocked = timeout(Duration::from_millis(50), async move {
+            bank2.wait_for_credit().await
+        })
+        .await;
+        assert!(blocked.is_err(), "second wait_for_credit should have blocked");
     }
 
     #[tokio::test]
@@ -108,10 +96,7 @@ mod tests {
         assert!(!got);
     }
 
-    /// Stress test that exercises the producer/consumer interleaving the bug
-    /// hit. Without `Notified::enable()` before re-checking, this hangs because
-    /// `notify_one` (or `notify_waiters`) issued between the consumer's
-    /// credit-check and `.await` would be missed.
+    /// Stress test: no producer/consumer interleaving should lose a wakeup.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_missed_wakeups_under_contention() {
         let bank = BackpressureBank::new(0);
@@ -122,7 +107,6 @@ mod tests {
         let consumer = tokio::spawn(async move {
             for _ in 0..N {
                 assert!(bank2.wait_for_credit().await);
-                bank2.decrease_credits(1);
             }
         });
 

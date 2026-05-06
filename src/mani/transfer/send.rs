@@ -171,7 +171,6 @@ impl TransferSendStream {
                     "stream closed".to_string(),
                 ));
             }
-            self.backpressure_bank.decrease_credits(1);
         }
 
         // Send all datagrams on the wire.
