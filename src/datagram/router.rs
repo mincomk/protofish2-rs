@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use quinn::ConnectionError;
-use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::sync::mpsc::Sender;
 use tokio::time::Instant;
 
 use crate::{
@@ -73,7 +73,7 @@ impl DatagramPacketRouter {
                             tracing::trace!("Received datagram with length {}", datagram.len());
 
                             if let Ok(packet) = parse_packet(datagram) {
-                                self.route(packet.stream_id, packet);
+                                self.route(packet.stream_id, packet).await;
                             } else {
                                 tracing::warn!("Failed to parse datagram into packet");
                             }
@@ -92,11 +92,11 @@ impl DatagramPacketRouter {
         }
     }
 
-    fn route(&self, stream_id: ManiStreamId, packet: Packet) {
+    async fn route(&self, stream_id: ManiStreamId, packet: Packet) {
         let mut remove_senders = Vec::new();
         if let Some(sender) = self.senders.get(&stream_id) {
             let sequence_number = packet.sequence_number;
-            match sender.try_send(packet) {
+            match sender.send(packet).await {
                 Ok(_) => {
                     tracing::trace!(
                         "Routed packet with sequence number {} to stream {}",
@@ -104,16 +104,7 @@ impl DatagramPacketRouter {
                         stream_id
                     );
                 }
-                Err(TrySendError::Full(_)) => {
-                    tracing::error!(
-                        "Tried to send packet with sequence number {} to stream {}, but the channel is full. Dropping packet",
-                        sequence_number,
-                        stream_id
-                    );
-
-                    // backpressure
-                }
-                Err(TrySendError::Closed(_)) => {
+                Err(_) => {
                     remove_senders.push(stream_id);
                 }
             }
