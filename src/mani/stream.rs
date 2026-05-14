@@ -559,12 +559,30 @@ impl ManiStreamTask {
         transfer_start: crate::mani::message::TransferStart,
     ) -> bool {
         if let Some(compression) = transfer_start.compression_type.to_boxed_compression() {
+            if self.max_datagram_channel_size < self.credits_bulk_update_count {
+                tracing::debug!(
+                    max_datagram_channel_size = self.max_datagram_channel_size,
+                    credits_bulk_update_count = self.credits_bulk_update_count,
+                    "max_datagram_channel_size is smaller than credits_bulk_update_count; \
+                     compression task may stall on chunk channel before a credit batch fits"
+                );
+            }
+
             let (dg_sender, dg_receiver) =
                 tokio::sync::mpsc::channel(self.max_datagram_channel_size);
 
             self.datagram_router.register(self.id, dg_sender.clone());
 
-            let transfer_streams = if transfer_start.mode == TransferMode::Dual {
+            let is_dual = transfer_start.mode == TransferMode::Dual;
+            let credit_coord = std::sync::Arc::new(
+                crate::mani::transfer::recv::CreditCoordinator::new(
+                    self.sender_command_sender.clone(),
+                    self.credits_bulk_update_count,
+                    is_dual,
+                ),
+            );
+
+            let transfer_streams = if is_dual {
                 let (s1, r1) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
                 let (s2, r2) = tokio::sync::mpsc::channel(self.max_datagram_channel_size);
                 let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1);
@@ -573,8 +591,6 @@ impl ManiStreamTask {
                     dg_receiver,
                     vec![s1, s2],
                     compression,
-                    self.sender_command_sender.clone(),
-                    self.credits_bulk_update_count,
                     self.max_chunk_buffer_size,
                 );
 
@@ -591,6 +607,7 @@ impl ManiStreamTask {
                     self.sender_command_sender.clone(),
                     self.max_retransmission_buffer_size,
                     pipeline_rx,
+                    credit_coord,
                 )
                 .await;
 
@@ -611,8 +628,6 @@ impl ManiStreamTask {
                     dg_receiver,
                     vec![s1],
                     compression,
-                    self.sender_command_sender.clone(),
-                    self.credits_bulk_update_count,
                     self.max_chunk_buffer_size,
                 );
 
@@ -625,6 +640,7 @@ impl ManiStreamTask {
                     self.is_ended.clone(),
                     r1,
                     self.end_notify.clone(),
+                    credit_coord,
                 )
                 .await;
 

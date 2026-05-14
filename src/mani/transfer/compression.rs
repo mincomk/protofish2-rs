@@ -6,7 +6,6 @@ use crate::{
     Timestamp,
     compression::Compression,
     datagram::packet::{DecodedContent, Packet, decode_content},
-    mani::transfer::recv::RecvSenderCommand,
 };
 
 /// Buffers in-flight fragments for a single logical chunk.
@@ -20,9 +19,6 @@ pub struct CompressedPacketReceiver {
     receiver: mpsc::Receiver<Packet>,
     senders: Vec<mpsc::Sender<Packet>>,
     compression: Box<dyn Compression>,
-    sender_command_sender: mpsc::Sender<RecvSenderCommand>,
-    credits_bulk_update_count: usize,
-    updated_credits: usize,
     /// Incomplete fragment groups keyed by `chunk_seq` (sequence number of first fragment).
     fragment_buffers: HashMap<u32, FragmentBuffer>,
     /// Maximum number of concurrent incomplete fragment groups before evicting the oldest.
@@ -34,17 +30,12 @@ impl CompressedPacketReceiver {
         receiver: mpsc::Receiver<Packet>,
         senders: Vec<mpsc::Sender<Packet>>,
         compression: Box<dyn Compression>,
-        sender_command_sender: mpsc::Sender<RecvSenderCommand>,
-        credits_bulk_update_count: usize,
         max_fragment_groups: usize,
     ) -> Self {
         Self {
             receiver,
             senders,
             compression,
-            sender_command_sender,
-            credits_bulk_update_count,
-            updated_credits: 0,
             fragment_buffers: HashMap::new(),
             max_fragment_groups,
         }
@@ -52,19 +43,6 @@ impl CompressedPacketReceiver {
 
     pub async fn run(&mut self) {
         while let Some(packet) = self.receiver.recv().await {
-            // Always update credits per received packet (fragment or single).
-            self.updated_credits += 1;
-            if self.updated_credits >= self.credits_bulk_update_count {
-                let command = RecvSenderCommand::UpdateCredits {
-                    additional_credits: self.updated_credits,
-                };
-                tracing::trace!("Sending credits update1: {}", self.updated_credits);
-                if let Err(err) = self.sender_command_sender.send(command).await {
-                    tracing::trace!("Failed to send credits update: {}", err);
-                }
-                self.updated_credits = 0;
-            }
-
             match decode_content(packet.content.clone()) {
                 Err(e) => {
                     tracing::warn!(
@@ -75,12 +53,14 @@ impl CompressedPacketReceiver {
                 }
                 Ok(DecodedContent::Single(compressed)) => {
                     let decompressed = self.compression.decompress(&compressed);
-                    let stop = self.route(
-                        packet.stream_id,
-                        packet.sequence_number,
-                        packet.timestamp,
-                        decompressed,
-                    );
+                    let stop = self
+                        .route(
+                            packet.stream_id,
+                            packet.sequence_number,
+                            packet.timestamp,
+                            decompressed,
+                        )
+                        .await;
                     if stop {
                         break;
                     }
@@ -143,12 +123,14 @@ impl CompressedPacketReceiver {
                             }
                             if ok {
                                 let decompressed = self.compression.decompress(&assembled.freeze());
-                                let stop = self.route(
-                                    packet.stream_id,
-                                    packet.sequence_number,
-                                    buf.timestamp,
-                                    decompressed,
-                                );
+                                let stop = self
+                                    .route(
+                                        packet.stream_id,
+                                        packet.sequence_number,
+                                        buf.timestamp,
+                                        decompressed,
+                                    )
+                                    .await;
                                 if stop {
                                     break;
                                 }
@@ -163,21 +145,20 @@ impl CompressedPacketReceiver {
     /// Routes a decompressed packet to all registered senders.
     /// Returns `true` if the receiver loop should stop (all senders dropped).
     ///
-    /// Uses `try_send` rather than awaiting on the downstream channel: blocking
-    /// here would stall the upstream loop, which is also responsible for
-    /// issuing `TransferCreditsUpdate` messages back to the sender. If those
-    /// credits stop flowing, the sender deadlocks once it exhausts its initial
-    /// backpressure budget. Packets dropped on a full downstream channel will
-    /// be detected as gaps by the assembler and recovered via NACK/retrans.
-    fn route(
+    /// Uses `send().await` on each downstream channel so backpressure from the
+    /// application consumer propagates back through the chunk channels into the
+    /// QUIC datagram channel, and ultimately into the sender's credit window.
+    /// Credits are returned by `CreditCoordinator` based on application drain,
+    /// so blocking here does not stall the credit-update path (that path lives
+    /// on the recv-stream side and runs through `ManiStreamTask`'s top-level
+    /// select, independent of the chunk channels).
+    async fn route(
         &self,
         stream_id: crate::ManiStreamId,
         sequence_number: crate::SequenceNumber,
         timestamp: Timestamp,
         decompressed: Vec<u8>,
     ) -> bool {
-        use tokio::sync::mpsc::error::TrySendError;
-
         let mut any_alive = false;
 
         for sender in &self.senders {
@@ -187,20 +168,15 @@ impl CompressedPacketReceiver {
                 timestamp,
                 content: Bytes::from(decompressed.clone()),
             };
-            match sender.try_send(packet) {
+            match sender.send(packet).await {
                 Ok(_) => {
                     any_alive = true;
                 }
-                Err(TrySendError::Full(_)) => {
-                    any_alive = true;
-                    tracing::warn!(
-                        stream_id = stream_id.0,
-                        sequence_number = sequence_number.0,
-                        "Downstream chunk channel full; dropping packet, will rely on NACK/retrans"
+                Err(_closed) => {
+                    tracing::debug!(
+                        "Failed to send decompressed packet on stream {}, sink dropped",
+                        stream_id.0
                     );
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::debug!("Failed to send decompressed packet, receiver likely dropped");
                 }
             }
         }

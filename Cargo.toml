@@ -1,5 +1,5 @@
 [workspace]
-members = ["examples/jitter_ogg"]
+members = ["crates/pf2-test","examples/jitter_ogg"]
 
 [package]
 name = "protofish2"

@@ -476,3 +476,248 @@ async fn test_fragmented_large_payload_unrel() {
     send_stream.end().await.expect("Failed to end transfer");
     server_task.await.unwrap();
 }
+
+/// Slow consumer + tight credit window: the sender must block on credits and
+/// no chunk channel overflow drops should occur. UnreliableOnly mode has no
+/// NACK/retrans, so any drop in the receive pipeline would manifest as a
+/// missing chunk.
+#[tokio::test]
+async fn test_slow_consumer_no_drops_unreliable_only() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (cert_chain, private_key) = generate_cert();
+
+    let mani_config = ManiConfig {
+        max_datagram_channel_size: 16,
+        max_chunk_buffer_size: 16,
+        initial_backpressure_credits: 16,
+        backpressure_credit_batch_size: 8,
+        ..ManiConfig::default()
+    };
+    let protofish_config = protofish2::config::ProtofishConfig {
+        mani_config,
+        ..protofish2::config::ProtofishConfig::default()
+    };
+
+    let server_config = ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        cert_chain: cert_chain.clone(),
+        private_key,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_interval: Duration::from_secs(5),
+        protofish_config: protofish_config.clone(),
+    };
+
+    let server = ProtofishServer::bind(server_config).expect("Failed to bind server");
+    let server_addr = server.local_addr().unwrap();
+
+    let client_config = ClientConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        root_certificates: cert_chain,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_range: Duration::from_secs(1)..Duration::from_secs(10),
+        protofish_config,
+    };
+
+    let client = ProtofishClient::bind(client_config).expect("Failed to bind client");
+
+    const N: usize = 200;
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("No incoming connection");
+        let mut server_conn = incoming.accept().await.expect("Server failed to accept");
+        let mut mani_stream = server_conn
+            .accept_mani()
+            .await
+            .expect("Failed to accept stream");
+
+        let streams = mani_stream
+            .accept_transfer()
+            .await
+            .expect("Failed to accept transfer");
+        let mut unreliable_recv = match streams {
+            protofish2::ManiTransferRecvStreams::UnreliableOnly { unreliable } => unreliable,
+            _ => panic!("Expected UnreliableOnly streams"),
+        };
+
+        let mut received = Vec::with_capacity(N);
+        while let Some(chunk) = unreliable_recv.recv().await {
+            received.push(chunk);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            if received.len() == N {
+                break;
+            }
+        }
+        assert_eq!(received.len(), N, "Expected {} chunks, got {}", N, received.len());
+        for (i, chunk) in received.iter().enumerate() {
+            assert_eq!(
+                chunk.content,
+                Bytes::from(format!("chunk {}", i)),
+                "Chunk {} mismatch (drops would manifest as missing chunks here)",
+                i
+            );
+        }
+    });
+
+    let mut client_conn = client
+        .connect(server_addr, "localhost", HashMap::new())
+        .await
+        .expect("Client failed to connect");
+
+    let mut mani_stream = client_conn
+        .open_mani()
+        .await
+        .expect("Failed to open stream");
+    let mut send_stream = mani_stream
+        .start_transfer(
+            protofish2::TransferMode::UnreliableOnly,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
+        .await
+        .expect("Failed to start transfer");
+
+    let send_start = std::time::Instant::now();
+    for i in 0..N {
+        send_stream
+            .send(Timestamp(i as u64), Bytes::from(format!("chunk {}", i)))
+            .await
+            .expect("Failed to send chunk");
+    }
+    let send_elapsed = send_start.elapsed();
+
+    assert!(
+        send_elapsed >= Duration::from_millis(150),
+        "Sender finished in {:?} — backpressure does not appear to be paced by the consumer",
+        send_elapsed
+    );
+
+    send_stream.end().await.expect("Failed to end transfer");
+    server_task.await.unwrap();
+}
+
+/// Dual mode: slow reliable consumer + fast unreliable consumer.
+/// With the min-of-counts policy, credits pace to the reliable side, so no
+/// drops occur on either sink.
+#[tokio::test]
+async fn test_slow_reliable_consumer_dual_no_drops() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (cert_chain, private_key) = generate_cert();
+
+    let mani_config = ManiConfig {
+        max_datagram_channel_size: 16,
+        max_chunk_buffer_size: 16,
+        initial_backpressure_credits: 16,
+        backpressure_credit_batch_size: 8,
+        ..ManiConfig::default()
+    };
+    let protofish_config = protofish2::config::ProtofishConfig {
+        mani_config,
+        ..protofish2::config::ProtofishConfig::default()
+    };
+
+    let server_config = ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        cert_chain: cert_chain.clone(),
+        private_key,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_interval: Duration::from_secs(5),
+        protofish_config: protofish_config.clone(),
+    };
+
+    let server = ProtofishServer::bind(server_config).expect("Failed to bind server");
+    let server_addr = server.local_addr().unwrap();
+
+    let client_config = ClientConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        root_certificates: cert_chain,
+        supported_compression_types: vec![CompressionType::None],
+        keepalive_range: Duration::from_secs(1)..Duration::from_secs(10),
+        protofish_config,
+    };
+
+    let client = ProtofishClient::bind(client_config).expect("Failed to bind client");
+
+    const N: usize = 200;
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("No incoming connection");
+        let mut server_conn = incoming.accept().await.expect("Server failed to accept");
+        let mut mani_stream = server_conn
+            .accept_mani()
+            .await
+            .expect("Failed to accept stream");
+
+        let streams = mani_stream
+            .accept_transfer()
+            .await
+            .expect("Failed to accept transfer");
+        let (mut reliable_recv, mut unreliable_recv) = match streams {
+            protofish2::ManiTransferRecvStreams::Dual {
+                reliable,
+                unreliable,
+            } => (reliable, unreliable),
+            _ => panic!("Expected Dual streams"),
+        };
+
+        let unreliable_handle = tokio::spawn(async move {
+            let mut count = 0;
+            while let Some(_chunk) = unreliable_recv.recv().await {
+                count += 1;
+            }
+            count
+        });
+
+        let mut received = 0;
+        while let Some(chunks) = reliable_recv.recv().await {
+            for chunk in chunks {
+                assert_eq!(
+                    chunk.content,
+                    Bytes::from(format!("chunk {}", received)),
+                    "Reliable chunk {} mismatch",
+                    received
+                );
+                received += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert_eq!(received, N);
+
+        let unrel_count = unreliable_handle.await.unwrap();
+        assert_eq!(
+            unrel_count, N,
+            "Unreliable side dropped packets — credits not gated on reliable drain"
+        );
+    });
+
+    let mut client_conn = client
+        .connect(server_addr, "localhost", HashMap::new())
+        .await
+        .expect("Client failed to connect");
+
+    let mut mani_stream = client_conn
+        .open_mani()
+        .await
+        .expect("Failed to open stream");
+    let mut send_stream = mani_stream
+        .start_transfer(
+            protofish2::TransferMode::Dual,
+            CompressionType::None,
+            protofish2::SequenceNumber(0),
+            None,
+        )
+        .await
+        .expect("Failed to start transfer");
+
+    for i in 0..N {
+        send_stream
+            .send(Timestamp(i as u64), Bytes::from(format!("chunk {}", i)))
+            .await
+            .expect("Failed to send chunk");
+    }
+
+    send_stream.end().await.expect("Failed to end transfer");
+    server_task.await.unwrap();
+}

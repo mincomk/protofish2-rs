@@ -16,6 +16,7 @@
           buildInputs = with pkgs; [
             openssl
             libopus
+            alsa-lib
             pkg-config
           ];
 
