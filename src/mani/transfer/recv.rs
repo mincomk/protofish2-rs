@@ -162,7 +162,7 @@ impl Drop for TransferReliableRecvStream {
         let coord = self.credit_coord.clone();
         let already = self.closed_signaled;
         if let Some(mut receiver) = self.receiver.take() {
-            tracing::warn!(
+            tracing::debug!(
                 stream_id = self.id.0,
                 "TransferReliableRecvStream dropped without consuming all data; draining channel"
             );
@@ -285,7 +285,7 @@ impl Drop for TransferUnreliableRecvStream {
         let coord = self.credit_coord.clone();
         let already = self.closed_signaled;
         if let Some(mut receiver) = self.receiver.take() {
-            tracing::warn!(
+            tracing::debug!(
                 stream_id = self.id.0,
                 "TransferUnreliableRecvStream dropped without consuming all data; draining channel"
             );
